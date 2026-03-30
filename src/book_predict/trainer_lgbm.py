@@ -166,9 +166,11 @@ def load_and_aggregate_sales(config: LGBMTrainerConfig) -> pd.DataFrame:
     )
 
     print("Loading item metadata...")
+    meta_usecols = ["INVENTORY_ITEM_ID"] + STATIC_COLUMNS
     meta = pd.read_csv(
         config.meta_path,
         encoding="utf-8-sig",
+        usecols=meta_usecols,
         dtype={"INVENTORY_ITEM_ID": "int64"},
         usecols=["INVENTORY_ITEM_ID", "LIST_PRICE_PER_UNIT",
                  "ITEM_CATEORY_CODE", "ITEM_CATEORY",
@@ -240,6 +242,9 @@ def load_and_aggregate_sales(config: LGBMTrainerConfig) -> pd.DataFrame:
         ("DLNUM", 0),
     ]:
         agg[col] = agg[col].fillna(fill)
+    agg["LIST_PRICE_PER_UNIT"] = pd.to_numeric(
+        agg["LIST_PRICE_PER_UNIT"], errors="coerce"
+    ).fillna(0.0).astype("float32")
 
     return agg
 
