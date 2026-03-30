@@ -2,13 +2,48 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+import time
 from typing import Iterable
 
+import os
 import joblib
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
 from sklearn.metrics import mean_absolute_error, root_mean_squared_error
+
+try:
+    from tqdm.auto import tqdm
+except Exception:
+    tqdm = None
+
+
+def _mem_gb() -> str:
+    """Current process RSS in GB (Linux)."""
+    try:
+        with open(f"/proc/{os.getpid()}/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    kb = int(line.split()[1])
+                    return f"{kb / 1_048_576:.1f}GB"
+    except Exception:
+        pass
+    return "?GB"
+
+
+def _iter_with_progress(iterable, total: int, desc: str):
+    if tqdm is None:
+        return iterable
+    return tqdm(iterable, total=total, desc=desc, unit="chunk")
+
+
+_FLOAT16_MAX = np.finfo(np.float16).max
+
+
+def _to_float16_safe(values: pd.Series) -> pd.Series:
+    """Clip to float16 range before casting to avoid RuntimeWarning overflow."""
+    numeric = pd.to_numeric(values, errors="coerce")
+    return numeric.clip(lower=-_FLOAT16_MAX, upper=_FLOAT16_MAX).astype("float16")
 
 
 # ---------------------------------------------------------------------------
@@ -71,8 +106,14 @@ class LGBMTrainerConfig:
     min_history_days: int = 10
     panel_days: int = 730
     max_items: int | None = None
+    max_train_rows: int | None = None          # cap training rows (subsample if exceeded)
+    device: str = "gpu"
     random_state: int = 42
     n_jobs: int = -1
+    max_bin: int | None = None
+    max_cat_threshold: int | None = None
+    max_cat_codes: int | None = None
+    gpu_safe: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -177,16 +218,29 @@ def select_eligible_items(
 
 
 # ---------------------------------------------------------------------------
-# Dense panel
+# Dense panel + feature engineering (fused per-chunk)
 # ---------------------------------------------------------------------------
 
-def _build_chunk_panel(
+def _forward_sum(values: pd.Series, horizon: int) -> pd.Series:
+    shifted = values.shift(-1)
+    return shifted[::-1].rolling(horizon, min_periods=horizon).sum()[::-1]
+
+
+def _build_chunk_features(
     chunk_items: np.ndarray,
     frame: pd.DataFrame,
     all_dates: pd.DatetimeIndex,
     item_bounds: pd.DataFrame,
+    horizons: list[int],
+    cat_mappings: dict[str, dict[str, int]] | None = None,
 ) -> pd.DataFrame:
-    """Build dense panel for a subset of items."""
+    """Build dense panel for a subset of items AND compute all features in-place.
+
+    Returns only the columns needed for training (ALL_FEATURES + targets + keys),
+    dropping heavy intermediates (XSJE, store_count, raw QTY) before returning.
+    If cat_mappings is provided, encodes categoricals as int16 codes.
+    """
+    # --- build dense panel ---
     bounds = item_bounds[item_bounds["INVENTORY_ITEM_ID"].isin(chunk_items)]
     date_df = pd.DataFrame({"XSRQ": all_dates})
 
@@ -207,17 +261,142 @@ def _build_chunk_panel(
         panel[col] = grouped[col].ffill()
         panel[col] = grouped[col].bfill()
 
+    # --- feature engineering (in-place on panel) ---
+    g = panel.groupby("INVENTORY_ITEM_ID", sort=False)
+
+    # Targets for each horizon
+    for h in horizons:
+        panel[f"target_{h}d"] = g["QTY"].transform(lambda s, hz=h: _forward_sum(s, hz))
+
+    # Lags
+    panel["lag_1"] = g["QTY"].shift(1)
+    panel["lag_7"] = g["QTY"].shift(7)
+    panel["lag_14"] = g["QTY"].shift(14)
+    panel["lag_28"] = g["QTY"].shift(28)
+    panel["lag_365"] = g["QTY"].shift(365)
+
+    # Rolling (on lag-1 shifted series to avoid leakage)
+    shifted = g["QTY"].shift(1)
+    rg = shifted.groupby(panel["INVENTORY_ITEM_ID"], sort=False)
+    panel["roll_sum_7"] = rg.transform(lambda s: s.rolling(7, min_periods=7).sum())
+    panel["roll_sum_14"] = rg.transform(lambda s: s.rolling(14, min_periods=14).sum())
+    panel["roll_sum_28"] = rg.transform(lambda s: s.rolling(28, min_periods=28).sum())
+    panel["roll_mean_7"] = panel["roll_sum_7"] / 7.0
+    panel["roll_mean_14"] = panel["roll_sum_14"] / 14.0
+    panel["roll_mean_28"] = panel["roll_sum_28"] / 28.0
+    panel["nonzero_days_28"] = rg.transform(lambda s: s.gt(0).rolling(28, min_periods=28).sum())
+
+    # Year-over-year rolling mean
+    shifted_yoy = g["QTY"].shift(365)
+    rg_yoy = shifted_yoy.groupby(panel["INVENTORY_ITEM_ID"], sort=False)
+    panel["roll_mean_28_yoy"] = rg_yoy.transform(lambda s: s.rolling(28, min_periods=14).mean())
+
+    # Days since last sale
+    prior = panel["XSRQ"].where(panel["QTY"] > 0)
+    prior = prior.groupby(panel["INVENTORY_ITEM_ID"], sort=False).ffill()
+    panel["days_since_sale"] = (panel["XSRQ"] - prior).dt.days
+
+    # Revenue-derived: avg revenue per unit over last 28 days
+    shifted_rev = g["XSJE"].shift(1)
+    rg_rev = shifted_rev.groupby(panel["INVENTORY_ITEM_ID"], sort=False)
+    roll_rev_28 = rg_rev.transform(lambda s: s.rolling(28, min_periods=1).sum())
+    roll_qty_28 = panel["roll_sum_28"].replace(0, np.nan)
+    panel["avg_revenue_per_unit_28"] = roll_rev_28 / roll_qty_28
+    panel["avg_revenue_per_unit_28"] = panel["avg_revenue_per_unit_28"].fillna(
+        panel["LIST_PRICE_PER_UNIT"]
+    )
+
+    # Store count rolling 28d
+    shifted_sc = g["store_count"].shift(1)
+    rg_sc = shifted_sc.groupby(panel["INVENTORY_ITEM_ID"], sort=False)
+    panel["store_count_28"] = rg_sc.transform(lambda s: s.rolling(28, min_periods=1).mean())
+
+    # Calendar features
+    cal = panel["XSRQ"].dt
+    panel["day_of_week"] = cal.dayofweek.astype("int8")
+    panel["day_of_month"] = cal.day.astype("int8")
+    panel["month"] = cal.month.astype("int8")
+    panel["week_of_year"] = _to_float16_safe(cal.isocalendar().week.astype("Int16"))
+    panel["is_month_start"] = cal.is_month_start.astype("int8")
+    panel["is_month_end"] = cal.is_month_end.astype("int8")
+    panel["item_age_days"] = _to_float16_safe((panel["XSRQ"] - panel["first_sale_date"]).dt.days)
+
+    # --- drop intermediates to free memory ---
+    panel.drop(columns=["XSJE", "store_count", "first_sale_date", "QTY"], inplace=True)
+
+    # --- encode categoricals as int16 codes (massive memory saving) ---
+    if cat_mappings is not None:
+        for col in CATEGORICAL_FEATURES:
+            mapping = cat_mappings[col]
+            panel[col] = panel[col].map(mapping).fillna(-1).astype("int16")
+
+    # --- quantize: keep higher-range means in float32, small counters in float16 ---
+    # Some rolling means can still exceed float16 max (65504) on popular items.
+    float16_cols = [
+        "nonzero_days_28",
+        "store_count_28",
+    ]
+    for col in float16_cols:
+        panel[col] = _to_float16_safe(panel[col])
+
+    # float32 for cols that can exceed 65504 (sums, lags, revenue)
+    float32_cols = [
+        "lag_1", "lag_7", "lag_14", "lag_28", "lag_365",
+        "roll_sum_7", "roll_sum_14", "roll_sum_28",
+        "roll_mean_7", "roll_mean_14", "roll_mean_28",
+        "roll_mean_28_yoy",
+        "avg_revenue_per_unit_28",
+    ]
+    for col in float32_cols:
+        panel[col] = panel[col].astype("float32")
+
+    # days_since_sale and LIST_PRICE_PER_UNIT stay float32 (wider range)
+    panel["days_since_sale"] = panel["days_since_sale"].astype("float32")
+    # DLNUM contains large identifiers (e.g. ~10,010,001), which overflow float16.
+    panel["DLNUM"] = pd.to_numeric(panel["DLNUM"], errors="coerce").astype("float32")
+
+    # Keep only what we need
+    target_cols = [f"target_{h}d" for h in horizons]
+    keep_cols = ["INVENTORY_ITEM_ID", "XSRQ"] + ALL_FEATURES + target_cols
+    panel = panel[keep_cols]
+
     return panel
 
 
-def build_dense_panel(
+def _build_cat_mapping(series: pd.Series, max_codes: int | None) -> tuple[dict, int]:
+    """Build category→code map, optionally keeping only top-frequency levels."""
+    non_null = series.dropna()
+    raw_cardinality = int(non_null.nunique())
+    if max_codes is not None:
+        if max_codes < 1:
+            raise ValueError("max_cat_codes must be >= 1 when provided.")
+        if raw_cardinality > max_codes:
+            kept_values = non_null.value_counts().head(max_codes).index.to_list()
+        else:
+            kept_values = pd.unique(non_null).tolist()
+    else:
+        kept_values = pd.unique(non_null).tolist()
+    return {v: i for i, v in enumerate(kept_values)}, raw_cardinality
+
+
+def build_featured_panel(
     frame: pd.DataFrame,
     eligible_items: np.ndarray,
     panel_days: int,
-    max_horizon: int,
+    horizons: list[int],
+    max_cat_codes: int | None = None,
     chunk_size: int = 20_000,
-) -> pd.DataFrame:
-    print("Building dense panel (chunked)...")
+) -> tuple[Path, dict[str, dict[str, int]]]:
+    """Build dense panel with features, writing chunks to parquet on disk.
+
+    Returns (chunk_dir, cat_mappings). Categoricals are int16-encoded.
+    The full panel is never held in memory at once.
+    """
+    import gc
+    import tempfile
+
+    print("Building featured panel (chunked, fused → parquet)...")
+    max_horizon = max(horizons)
     frame = frame[frame["INVENTORY_ITEM_ID"].isin(eligible_items)].copy()
 
     # Downcast numerics to save memory
@@ -237,115 +416,210 @@ def build_dense_panel(
         "first_sale_date": item_first.values,
     })
 
-    # Process in chunks to avoid OOM
-    n_chunks = max(1, len(eligible_items) // chunk_size)
+    # Build categorical mappings: string → int16 code (built once, applied per chunk)
+    cap_note = f" [max_cat_codes={max_cat_codes}]" if max_cat_codes is not None else ""
+    print(f"Building categorical mappings...{cap_note}")
+    cat_mappings: dict[str, dict[str, int]] = {}
+    truncated_cardinality: dict[str, tuple[int, int]] = {}
+    for col in CATEGORICAL_FEATURES:
+        if col in frame.columns:
+            mapping, raw_cardinality = _build_cat_mapping(frame[col], max_cat_codes=max_cat_codes)
+        else:
+            mapping, raw_cardinality = {}, 0
+        cat_mappings[col] = mapping
+        if raw_cardinality > len(mapping):
+            truncated_cardinality[col] = (raw_cardinality, len(mapping))
+
+    print(f"  Categorical cardinalities: { {k: len(v) for k, v in cat_mappings.items()} }")
+    if truncated_cardinality:
+        print(f"  Truncated categories (raw -> kept): {truncated_cardinality}")
+
+    # Process in chunks — write each to parquet, free memory immediately
+    tmp_dir = Path(tempfile.mkdtemp(prefix="book_predict_chunks_"))
+    n_chunks = max(1, int(np.ceil(len(eligible_items) / chunk_size)))
     item_chunks = np.array_split(eligible_items, n_chunks)
 
-    panels: list[pd.DataFrame] = []
     total_rows = 0
-    for i, chunk_items in enumerate(item_chunks):
-        chunk_panel = _build_chunk_panel(chunk_items, frame, all_dates, item_bounds)
-        total_rows += len(chunk_panel)
-        panels.append(chunk_panel)
-        print(f"  Chunk {i + 1}/{len(item_chunks)}: {len(chunk_items):,} items, {len(chunk_panel):,} rows (cumulative: {total_rows:,})")
+    for i, chunk_items in enumerate(
+        _iter_with_progress(item_chunks, total=len(item_chunks), desc="Build chunks")
+    ):
+        chunk_panel = _build_chunk_features(
+            chunk_items, frame, all_dates, item_bounds, horizons,
+            cat_mappings=cat_mappings,
+        )
+        n_rows = len(chunk_panel)
+        total_rows += n_rows
+        chunk_panel.to_parquet(tmp_dir / f"chunk_{i:04d}.parquet", index=False)
+        del chunk_panel
+        gc.collect()
+        print(
+            f"  Chunk {i + 1}/{len(item_chunks)}: "
+            f"{len(chunk_items):,} items, {n_rows:,} rows "
+            f"(cumulative: {total_rows:,}) [RSS: {_mem_gb()}]"
+        )
 
-    panel = pd.concat(panels, ignore_index=True)
-    print(f"  Panel shape: {panel.shape}")
-    return panel
+    print(f"  Total rows written: {total_rows:,} across {len(item_chunks)} parquet files")
 
+    # Save categorical mappings for inference
+    joblib.dump(cat_mappings, tmp_dir / "cat_mappings.joblib")
 
-# ---------------------------------------------------------------------------
-# Feature engineering
-# ---------------------------------------------------------------------------
-
-def _forward_sum(values: pd.Series, horizon: int) -> pd.Series:
-    shifted = values.shift(-1)
-    return shifted[::-1].rolling(horizon, min_periods=horizon).sum()[::-1]
-
-
-def add_features(panel: pd.DataFrame, horizon: int) -> pd.DataFrame:
-    frame = panel.copy()
-    g = frame.groupby("INVENTORY_ITEM_ID", sort=False)
-
-    # Target
-    frame[f"target_{horizon}d"] = g["QTY"].transform(lambda s: _forward_sum(s, horizon))
-
-    # Lags
-    frame["lag_1"] = g["QTY"].shift(1)
-    frame["lag_7"] = g["QTY"].shift(7)
-    frame["lag_14"] = g["QTY"].shift(14)
-    frame["lag_28"] = g["QTY"].shift(28)
-    frame["lag_365"] = g["QTY"].shift(365)
-
-    # Rolling (on lag-1 shifted series to avoid leakage)
-    shifted = g["QTY"].shift(1)
-    rg = shifted.groupby(frame["INVENTORY_ITEM_ID"], sort=False)
-    frame["roll_sum_7"] = rg.transform(lambda s: s.rolling(7, min_periods=7).sum())
-    frame["roll_sum_14"] = rg.transform(lambda s: s.rolling(14, min_periods=14).sum())
-    frame["roll_sum_28"] = rg.transform(lambda s: s.rolling(28, min_periods=28).sum())
-    frame["roll_mean_7"] = frame["roll_sum_7"] / 7.0
-    frame["roll_mean_14"] = frame["roll_sum_14"] / 14.0
-    frame["roll_mean_28"] = frame["roll_sum_28"] / 28.0
-    frame["nonzero_days_28"] = rg.transform(lambda s: s.gt(0).rolling(28, min_periods=28).sum())
-
-    # Year-over-year rolling mean (28-day window ending 365 days ago)
-    shifted_yoy = g["QTY"].shift(365)
-    rg_yoy = shifted_yoy.groupby(frame["INVENTORY_ITEM_ID"], sort=False)
-    frame["roll_mean_28_yoy"] = rg_yoy.transform(lambda s: s.rolling(28, min_periods=14).mean())
-
-    # Days since last sale
-    prior = frame["XSRQ"].where(frame["QTY"] > 0)
-    prior = prior.groupby(frame["INVENTORY_ITEM_ID"], sort=False).ffill()
-    frame["days_since_sale"] = (frame["XSRQ"] - prior).dt.days
-
-    # Revenue-derived: avg revenue per unit over last 28 days
-    shifted_rev = g["XSJE"].shift(1)
-    rg_rev = shifted_rev.groupby(frame["INVENTORY_ITEM_ID"], sort=False)
-    roll_rev_28 = rg_rev.transform(lambda s: s.rolling(28, min_periods=1).sum())
-    roll_qty_28 = frame["roll_sum_28"].replace(0, np.nan)
-    frame["avg_revenue_per_unit_28"] = roll_rev_28 / roll_qty_28
-    frame["avg_revenue_per_unit_28"] = frame["avg_revenue_per_unit_28"].fillna(
-        frame["LIST_PRICE_PER_UNIT"]
-    )
-
-    # Store count rolling 28d
-    shifted_sc = g["store_count"].shift(1)
-    rg_sc = shifted_sc.groupby(frame["INVENTORY_ITEM_ID"], sort=False)
-    frame["store_count_28"] = rg_sc.transform(lambda s: s.rolling(28, min_periods=1).mean())
-
-    # Calendar
-    cal = frame["XSRQ"].dt
-    frame["day_of_week"] = cal.dayofweek
-    frame["day_of_month"] = cal.day
-    frame["month"] = cal.month
-    frame["week_of_year"] = cal.isocalendar().week.astype("int16")
-    frame["is_month_start"] = cal.is_month_start.astype("int8")
-    frame["is_month_end"] = cal.is_month_end.astype("int8")
-    frame["item_age_days"] = (frame["XSRQ"] - frame["first_sale_date"]).dt.days
-
-    frame = frame.drop(columns=["first_sale_date"])
-    return frame
+    return tmp_dir, cat_mappings
 
 
-# ---------------------------------------------------------------------------
-# Train/valid/test split
-# ---------------------------------------------------------------------------
+def _required_cols_for_horizon(horizon: int) -> tuple[str, list[str]]:
+    target_col = f"target_{horizon}d"
+    required_cols = [
+        target_col,
+        "lag_1", "lag_7", "lag_14", "lag_28",
+        "roll_sum_7", "roll_sum_14", "roll_sum_28",
+        "days_since_sale",
+    ]
+    return target_col, required_cols
 
-def split_by_time(
-    frame: pd.DataFrame, horizon: int
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    usable = frame.dropna(subset=[f"target_{horizon}d"]).copy()
-    unique_dates = np.sort(usable["XSRQ"].unique())
-    if len(unique_dates) < 120:
+
+def _load_cols_for_horizon(horizon: int, include_ids: bool = True) -> list[str]:
+    target_col, _ = _required_cols_for_horizon(horizon)
+    cols = ["XSRQ"] + (["INVENTORY_ITEM_ID"] if include_ids else []) + ALL_FEATURES + [target_col]
+    return cols
+
+
+def _iter_filtered_chunks(
+    chunk_dir: Path,
+    horizon: int,
+    *,
+    include_ids: bool,
+    desc: str,
+):
+    target_col, required_cols = _required_cols_for_horizon(horizon)
+    load_cols = _load_cols_for_horizon(horizon, include_ids=include_ids)
+    chunk_files = sorted(chunk_dir.glob("chunk_*.parquet"))
+
+    total_kept = 0
+    for i, f in enumerate(
+        _iter_with_progress(chunk_files, total=len(chunk_files), desc=desc)
+    ):
+        chunk = pd.read_parquet(f, columns=load_cols)
+        chunk = chunk.dropna(subset=required_cols)
+        total_kept += len(chunk)
+        print(
+            f"  Read chunk {i + 1}/{len(chunk_files)}: "
+            f"kept {len(chunk):,} rows "
+            f"(cumulative: {total_kept:,}) [RSS: {_mem_gb()}]"
+        )
+        yield chunk
+
+
+def _determine_split_dates(chunk_dir: Path, horizon: int) -> tuple[pd.Timestamp, pd.Timestamp]:
+    unique_dates: set[pd.Timestamp] = set()
+    for chunk in _iter_filtered_chunks(
+        chunk_dir, horizon, include_ids=False, desc=f"Dates {horizon}d"
+    ):
+        unique_dates.update(pd.to_datetime(chunk["XSRQ"].unique()).tolist())
+
+    ordered_dates = np.sort(np.array(list(unique_dates), dtype="datetime64[ns]"))
+    if len(ordered_dates) < 120:
         raise ValueError("Not enough history to create reliable time-based splits.")
 
-    train_end = unique_dates[int(len(unique_dates) * 0.70)]
-    valid_end = unique_dates[int(len(unique_dates) * 0.85)]
+    train_end = pd.Timestamp(ordered_dates[int(len(ordered_dates) * 0.70)])
+    valid_end = pd.Timestamp(ordered_dates[int(len(ordered_dates) * 0.85)])
+    print(
+        f"  Split dates for {horizon}d: "
+        f"train<= {train_end.date()}  valid<= {valid_end.date()}  "
+        f"({len(ordered_dates)} usable dates)"
+    )
+    return train_end, valid_end
 
-    train = usable[usable["XSRQ"] <= train_end].copy()
-    valid = usable[(usable["XSRQ"] > train_end) & (usable["XSRQ"] <= valid_end)].copy()
-    test = usable[usable["XSRQ"] > valid_end].copy()
-    return train, valid, test
+
+def _count_split_rows(
+    chunk_dir: Path,
+    horizon: int,
+    train_end: pd.Timestamp,
+    valid_end: pd.Timestamp,
+) -> tuple[int, int, int]:
+    train_rows = 0
+    valid_rows = 0
+    test_rows = 0
+    for chunk in _iter_filtered_chunks(
+        chunk_dir, horizon, include_ids=False, desc=f"Count {horizon}d"
+    ):
+        train_rows += int((chunk["XSRQ"] <= train_end).sum())
+        valid_rows += int(((chunk["XSRQ"] > train_end) & (chunk["XSRQ"] <= valid_end)).sum())
+        test_rows += int((chunk["XSRQ"] > valid_end).sum())
+
+    print(
+        f"  Split row counts for {horizon}d: "
+        f"train={train_rows:,} valid={valid_rows:,} test={test_rows:,}"
+    )
+    return train_rows, valid_rows, test_rows
+
+
+def _write_train_valid_files(
+    chunk_dir: Path,
+    horizon: int,
+    train_end: pd.Timestamp,
+    valid_end: pd.Timestamp,
+    staging_dir: Path,
+    *,
+    max_train_rows: int | None,
+    random_state: int,
+) -> tuple[Path, Path, int, int, int]:
+    import gc
+
+    rng = np.random.default_rng(random_state)
+    target_col, _ = _required_cols_for_horizon(horizon)
+    train_path = staging_dir / f"train_{horizon}d.csv"
+    valid_path = staging_dir / f"valid_{horizon}d.csv"
+
+    train_rows_target: int | None = None
+    keep_probability = 1.0
+    if max_train_rows is not None:
+        train_rows_target, _, _ = _count_split_rows(chunk_dir, horizon, train_end, valid_end)
+        if train_rows_target > max_train_rows:
+            keep_probability = max_train_rows / train_rows_target
+            print(
+                f"  Training row cap for {horizon}d: "
+                f"{train_rows_target:,} -> about {max_train_rows:,} "
+                f"(keep_probability={keep_probability:.4f})"
+            )
+
+    written_train = 0
+    written_valid = 0
+    seen_test = 0
+    wrote_train_header = False
+    wrote_valid_header = False
+    export_cols = [target_col] + ALL_FEATURES
+
+    for chunk in _iter_filtered_chunks(
+        chunk_dir, horizon, include_ids=False, desc=f"Stage {horizon}d"
+    ):
+        train_chunk = chunk[chunk["XSRQ"] <= train_end]
+        if keep_probability < 1.0 and len(train_chunk) > 0:
+            mask = rng.random(len(train_chunk)) < keep_probability
+            train_chunk = train_chunk.loc[mask]
+        valid_chunk = chunk[(chunk["XSRQ"] > train_end) & (chunk["XSRQ"] <= valid_end)]
+        seen_test += int((chunk["XSRQ"] > valid_end).sum())
+
+        if len(train_chunk) > 0:
+            train_chunk[export_cols].to_csv(
+                train_path, mode="a", header=not wrote_train_header, index=False
+            )
+            wrote_train_header = True
+            written_train += len(train_chunk)
+        if len(valid_chunk) > 0:
+            valid_chunk[export_cols].to_csv(
+                valid_path, mode="a", header=not wrote_valid_header, index=False
+            )
+            wrote_valid_header = True
+            written_valid += len(valid_chunk)
+
+        del chunk, train_chunk, valid_chunk
+        gc.collect()
+
+    print(
+        f"  Staged {horizon}d files: "
+        f"train={written_train:,} valid={written_valid:,} test={seen_test:,}"
+    )
+    return train_path, valid_path, written_train, written_valid, seen_test
 
 
 # ---------------------------------------------------------------------------
@@ -368,15 +642,50 @@ def _metric_frame(
     }
 
 
+def _empty_metric_accumulator() -> dict[str, float]:
+    return {
+        "count": 0.0,
+        "abs_err_sum": 0.0,
+        "sq_err_sum": 0.0,
+        "abs_true_sum": 0.0,
+        "baseline_abs_err_sum": 0.0,
+    }
+
+
+def _update_metric_accumulator(
+    acc: dict[str, float],
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    baseline: np.ndarray,
+) -> None:
+    acc["count"] += float(len(y_true))
+    acc["abs_err_sum"] += float(np.abs(y_true - y_pred).sum())
+    acc["sq_err_sum"] += float(np.square(y_true - y_pred).sum())
+    acc["abs_true_sum"] += float(np.abs(y_true).sum())
+    acc["baseline_abs_err_sum"] += float(np.abs(y_true - baseline).sum())
+
+
+def _finalize_metric_accumulator(acc: dict[str, float]) -> dict[str, float]:
+    count = max(acc["count"], 1.0)
+    abs_true_sum = max(acc["abs_true_sum"], 1e-9)
+    return {
+        "mae": acc["abs_err_sum"] / count,
+        "rmse": float(np.sqrt(acc["sq_err_sum"] / count)),
+        "wape": acc["abs_err_sum"] / abs_true_sum,
+        "baseline_mae": acc["baseline_abs_err_sum"] / count,
+        "baseline_wape": acc["baseline_abs_err_sum"] / abs_true_sum,
+    }
+
+
 # ---------------------------------------------------------------------------
 # LightGBM model
 # ---------------------------------------------------------------------------
 
-def build_lgbm_params(random_state: int, n_jobs: int) -> dict:
-    return {
+def build_lgbm_params(config: LGBMTrainerConfig, device: str) -> dict:
+    params = {
         "objective": "regression_l1",      # MAE — robust to QTY outliers
         "metric": "mae",
-        "device": "gpu",
+        "device": device,
         "learning_rate": 0.05,
         "num_leaves": 255,
         "min_child_samples": 200,
@@ -386,9 +695,112 @@ def build_lgbm_params(random_state: int, n_jobs: int) -> dict:
         "lambda_l1": 0.1,
         "lambda_l2": 1.0,
         "verbose": -1,
-        "seed": random_state,
-        "n_jobs": n_jobs,
+        "seed": config.random_state,
+        "n_jobs": config.n_jobs,
     }
+    if config.max_bin is not None:
+        params["max_bin"] = int(config.max_bin)
+    if config.max_cat_threshold is not None:
+        params["max_cat_threshold"] = int(config.max_cat_threshold)
+    if config.gpu_safe and device == "gpu":
+        params.setdefault("max_bin", 255)
+        params.setdefault("max_cat_threshold", 64)
+    return params
+
+
+def _train_booster_with_fallback(
+    dtrain: lgb.Dataset,
+    dvalid: lgb.Dataset,
+    config: LGBMTrainerConfig,
+    callbacks: list,
+) -> tuple[lgb.Booster, float, str]:
+    """Train on the configured device, retrying on CPU if GPU training fails."""
+    requested_device = config.device
+    attempt_order = [requested_device]
+    if requested_device == "gpu":
+        attempt_order.append("cpu")
+
+    last_error: Exception | None = None
+    for device in attempt_order:
+        params = build_lgbm_params(config, device)
+        try:
+            train_started = time.perf_counter()
+            booster = lgb.train(
+                params,
+                dtrain,
+                num_boost_round=1000,
+                valid_sets=[dvalid],
+                callbacks=callbacks,
+            )
+            train_elapsed = time.perf_counter() - train_started
+            return booster, train_elapsed, device
+        except lgb.basic.LightGBMError as exc:
+            last_error = exc
+            if device != "gpu":
+                raise
+            print(f"  GPU training failed: {exc}")
+            print("  Falling back to CPU for this horizon.")
+
+    assert last_error is not None
+    raise last_error
+
+
+def _evaluate_streaming_splits(
+    chunk_dir: Path,
+    horizon: int,
+    booster: lgb.Booster,
+    output_dir: Path,
+    train_end: pd.Timestamp,
+    valid_end: pd.Timestamp,
+) -> tuple[dict[str, float], dict[str, float], int, int]:
+    target_col, _ = _required_cols_for_horizon(horizon)
+    valid_acc = _empty_metric_accumulator()
+    test_acc = _empty_metric_accumulator()
+    valid_rows = 0
+    test_rows = 0
+    predictions_path = output_dir / "test_predictions.csv"
+    if predictions_path.exists():
+        predictions_path.unlink()
+    wrote_predictions_header = False
+
+    for chunk in _iter_filtered_chunks(
+        chunk_dir, horizon, include_ids=True, desc=f"Eval {horizon}d"
+    ):
+        valid_chunk = chunk[(chunk["XSRQ"] > train_end) & (chunk["XSRQ"] <= valid_end)]
+        test_chunk = chunk[chunk["XSRQ"] > valid_end]
+
+        if len(valid_chunk) > 0:
+            valid_pred = booster.predict(valid_chunk[ALL_FEATURES])
+            valid_y = valid_chunk[target_col].to_numpy()
+            valid_baseline = valid_chunk["roll_mean_28"].to_numpy().astype("float32") * horizon
+            _update_metric_accumulator(valid_acc, valid_y, valid_pred, valid_baseline)
+            valid_rows += len(valid_chunk)
+
+        if len(test_chunk) > 0:
+            test_pred = booster.predict(test_chunk[ALL_FEATURES])
+            test_y = test_chunk[target_col].to_numpy()
+            test_baseline = test_chunk["roll_mean_28"].to_numpy().astype("float32") * horizon
+            _update_metric_accumulator(test_acc, test_y, test_pred, test_baseline)
+            test_rows += len(test_chunk)
+
+            predictions = test_chunk[["INVENTORY_ITEM_ID", "XSRQ", target_col]].copy()
+            predictions["prediction"] = test_pred
+            predictions["baseline_prediction"] = test_baseline
+            predictions.to_csv(
+                predictions_path,
+                mode="a",
+                header=not wrote_predictions_header,
+                index=False,
+                encoding="utf-8-sig",
+            )
+            wrote_predictions_header = True
+
+    return (
+        _finalize_metric_accumulator(valid_acc),
+        _finalize_metric_accumulator(test_acc),
+        valid_rows,
+        test_rows,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -396,67 +808,74 @@ def build_lgbm_params(random_state: int, n_jobs: int) -> dict:
 # ---------------------------------------------------------------------------
 
 def train_for_horizon(
-    panel: pd.DataFrame, config: LGBMTrainerConfig, horizon: int
+    chunk_dir: Path, config: LGBMTrainerConfig, horizon: int,
+    cat_mappings: dict[str, dict[str, int]] | None = None,
 ) -> dict[str, object]:
+    """Train a LightGBM model for a single horizon.
+
+    Trains from staged on-disk files to avoid concatenating all rows in RAM.
+    """
+    import gc
+    import shutil
+    import tempfile
+
     print(f"\n--- Horizon {horizon}d ---")
-    featured = add_features(panel, horizon=horizon)
-    featured = featured.dropna(
-        subset=[
-            f"target_{horizon}d",
-            "lag_1", "lag_7", "lag_14", "lag_28",
-            "roll_sum_7", "roll_sum_14", "roll_sum_28",
-            "days_since_sale",
-        ]
-    ).copy()
-
-    # Encode categoricals as pandas category (LightGBM reads these natively)
-    for col in CATEGORICAL_FEATURES:
-        featured[col] = featured[col].astype("category")
-
     target_col = f"target_{horizon}d"
-    train, valid, test = split_by_time(featured, horizon)
+    train_end, valid_end = _determine_split_dates(chunk_dir, horizon)
 
-    train_x, train_y = train[ALL_FEATURES], train[target_col].to_numpy()
-    valid_x, valid_y = valid[ALL_FEATURES], valid[target_col].to_numpy()
-    test_x, test_y = test[ALL_FEATURES], test[target_col].to_numpy()
+    staging_dir = Path(tempfile.mkdtemp(prefix=f"book_predict_stage_{horizon}d_"))
+    train_path, valid_path, train_rows, _, _ = _write_train_valid_files(
+        chunk_dir,
+        horizon,
+        train_end,
+        valid_end,
+        staging_dir,
+        max_train_rows=config.max_train_rows,
+        random_state=config.random_state,
+    )
 
-    baseline_valid = valid["roll_mean_28"].to_numpy() * horizon
-    baseline_test = test["roll_mean_28"].to_numpy() * horizon
+    # Tell LightGBM which columns are categorical (they're int16-encoded)
+    cat_feature_indices = [ALL_FEATURES.index(c) for c in CATEGORICAL_FEATURES]
+    dtrain = lgb.Dataset(
+        str(train_path),
+        params={"header": True, "label_column": 0},
+        feature_name=ALL_FEATURES,
+        categorical_feature=cat_feature_indices,
+        free_raw_data=True,
+    )
+    dvalid = lgb.Dataset(
+        str(valid_path),
+        params={"header": True, "label_column": 0},
+        feature_name=ALL_FEATURES,
+        categorical_feature=cat_feature_indices,
+        reference=dtrain,
+        free_raw_data=True,
+    )
 
-    dtrain = lgb.Dataset(train_x, label=train_y, categorical_feature=CATEGORICAL_FEATURES, free_raw_data=False)
-    dvalid = lgb.Dataset(valid_x, label=valid_y, categorical_feature=CATEGORICAL_FEATURES, reference=dtrain, free_raw_data=False)
-
-    params = build_lgbm_params(config.random_state, config.n_jobs)
     callbacks = [
         lgb.early_stopping(stopping_rounds=50, verbose=False),
         lgb.log_evaluation(period=50),
     ]
 
-    booster = lgb.train(
-        params,
-        dtrain,
-        num_boost_round=1000,
-        valid_sets=[dvalid],
-        callbacks=callbacks,
+    booster, train_elapsed, actual_device = _train_booster_with_fallback(
+        dtrain, dvalid, config, callbacks
     )
-
-    valid_pred = booster.predict(valid_x)
-    test_pred = booster.predict(test_x)
-
-    valid_metrics = _metric_frame(valid_y, valid_pred, baseline_valid)
-    test_metrics = _metric_frame(test_y, test_pred, baseline_test)
 
     # Save
     output_dir = config.output_dir / f"horizon_{horizon}d"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    booster.save_model(str(output_dir / "model.lgb"))
-    joblib.dump({"booster_path": str(output_dir / "model.lgb"), "features": ALL_FEATURES}, output_dir / "model_meta.joblib")
+    valid_metrics, test_metrics, valid_rows, test_rows = _evaluate_streaming_splits(
+        chunk_dir, horizon, booster, output_dir, train_end, valid_end
+    )
 
-    predictions = test[["INVENTORY_ITEM_ID", "XSRQ", target_col, "QTY"]].copy()
-    predictions["prediction"] = test_pred
-    predictions["baseline_prediction"] = baseline_test
-    predictions.to_csv(output_dir / "test_predictions.csv", index=False, encoding="utf-8-sig")
+    booster.save_model(str(output_dir / "model.lgb"))
+    joblib.dump({
+        "booster_path": str(output_dir / "model.lgb"),
+        "features": ALL_FEATURES,
+        "categorical_features": CATEGORICAL_FEATURES,
+        "cat_mappings": cat_mappings,
+    }, output_dir / "model_meta.joblib")
 
     pd.DataFrame([
         {"split": "valid", **valid_metrics},
@@ -472,15 +891,20 @@ def train_for_horizon(
 
     print(f"  valid  MAE={valid_metrics['mae']:.2f}  WAPE={valid_metrics['wape']:.4f}  (baseline WAPE={valid_metrics['baseline_wape']:.4f})")
     print(f"  test   MAE={test_metrics['mae']:.2f}  WAPE={test_metrics['wape']:.4f}  (baseline WAPE={test_metrics['baseline_wape']:.4f})")
+    print(f"  train  elapsed={train_elapsed:.1f}s  device={actual_device}")
+    shutil.rmtree(staging_dir, ignore_errors=True)
+    gc.collect()
 
     return {
         "horizon": horizon,
         "valid_metrics": valid_metrics,
         "test_metrics": test_metrics,
-        "train_rows": int(len(train)),
-        "valid_rows": int(len(valid)),
-        "test_rows": int(len(test)),
+        "train_rows": int(train_rows),
+        "valid_rows": int(valid_rows),
+        "test_rows": int(test_rows),
         "best_iteration": int(booster.best_iteration),
+        "device_used": actual_device,
+        "train_elapsed_sec": float(train_elapsed),
         "output_dir": output_dir,
     }
 
@@ -490,27 +914,64 @@ def train_for_horizon(
 # ---------------------------------------------------------------------------
 
 def run_training(config: LGBMTrainerConfig) -> list[dict[str, object]]:
+    import gc
+
+    effective_max_cat_codes = config.max_cat_codes
+    if config.gpu_safe and config.device == "gpu" and effective_max_cat_codes is None:
+        effective_max_cat_codes = 255
+
+    visible_cpus = os.cpu_count() or 1
+    if config.n_jobs == -1:
+        thread_note = "all visible logical cores"
+    elif config.n_jobs <= 0:
+        thread_note = "LightGBM/OpenMP default behavior"
+    else:
+        thread_note = str(config.n_jobs)
+    print(
+        f"Threading: n_jobs={config.n_jobs} "
+        f"(visible_cpus={visible_cpus}, effective={thread_note})"
+    )
+    if config.device == "gpu":
+        effective_max_bin = config.max_bin if config.max_bin is not None else (255 if config.gpu_safe else "default")
+        effective_max_cat_threshold = (
+            config.max_cat_threshold
+            if config.max_cat_threshold is not None
+            else (64 if config.gpu_safe else "default")
+        )
+        print(
+            "GPU binning: "
+            f"max_bin={effective_max_bin}, "
+            f"max_cat_threshold={effective_max_cat_threshold}, "
+            f"max_cat_codes={effective_max_cat_codes if effective_max_cat_codes is not None else 'unlimited'}"
+        )
+
     sales = load_and_aggregate_sales(config)
     eligible_items = select_eligible_items(
         sales,
         min_history_days=config.min_history_days,
         max_items=config.max_items,
     )
-    print(f"Eligible items: {len(eligible_items):,}")
+    print(f"Eligible items: {len(eligible_items):,} [RSS: {_mem_gb()}]")
     if len(eligible_items) == 0:
         raise ValueError("No items satisfied the minimum history threshold.")
 
-    panel = build_dense_panel(
+    chunk_dir, cat_mappings = build_featured_panel(
         sales,
         eligible_items=eligible_items,
         panel_days=config.panel_days,
-        max_horizon=max(config.horizons),
+        horizons=config.horizons,
+        max_cat_codes=effective_max_cat_codes,
     )
-    print(f"Panel shape: {panel.shape}")
+    print(f"Chunk parquet directory: {chunk_dir} [RSS: {_mem_gb()}]")
+    del sales
+    gc.collect()
+    print(f"Freed sales data [RSS: {_mem_gb()}]")
 
     results = []
     for horizon in config.horizons:
-        results.append(train_for_horizon(panel, config, horizon))
+        results.append(train_for_horizon(chunk_dir, config, horizon, cat_mappings=cat_mappings))
+        gc.collect()
+        print(f"Finished horizon {horizon}d [RSS: {_mem_gb()}]")
 
     summary = []
     for r in results:
@@ -527,6 +988,10 @@ def run_training(config: LGBMTrainerConfig) -> list[dict[str, object]]:
             "test_wape": r["test_metrics"]["wape"],
             "test_baseline_wape": r["test_metrics"]["baseline_wape"],
         })
+
+    # Clean up temp parquet files
+    import shutil
+    shutil.rmtree(chunk_dir, ignore_errors=True)
 
     config.output_dir.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(summary).to_csv(
