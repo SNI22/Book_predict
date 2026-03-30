@@ -139,6 +139,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable GPU-safe defaults: max_bin=255, max_cat_threshold=64, max_cat_codes=255 (unless overridden).",
     )
+    parser.add_argument(
+        "--build-workers",
+        type=int,
+        default=1,
+        help="Process workers for chunked pandas feature build (1 = sequential). Increase carefully due RAM usage.",
+    )
     return parser.parse_args()
 
 
@@ -162,6 +168,7 @@ def main() -> None:
         max_cat_threshold=args.max_cat_threshold,
         max_cat_codes=args.max_cat_codes,
         gpu_safe=args.gpu_safe,
+        build_workers=args.build_workers,
     )
     results = run_training(config)
     print("\n=== Summary ===")

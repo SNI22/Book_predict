@@ -38,6 +38,7 @@ def _iter_with_progress(iterable, total: int, desc: str):
 
 
 _FLOAT16_MAX = np.finfo(np.float16).max
+_BUILD_WORKER_CTX: dict[str, object] | None = None
 
 
 def _to_float16_safe(values: pd.Series) -> pd.Series:
@@ -114,6 +115,17 @@ class LGBMTrainerConfig:
     max_cat_threshold: int | None = None
     max_cat_codes: int | None = None
     gpu_safe: bool = False
+    build_workers: int = 1
+
+
+def _resolve_n_jobs(requested_n_jobs: int) -> int:
+    """Resolve user n_jobs into an explicit positive thread count."""
+    visible_cpus = os.cpu_count() or 1
+    if requested_n_jobs in (-1, 0):
+        return visible_cpus
+    if requested_n_jobs < -1:
+        return min(abs(requested_n_jobs), visible_cpus)
+    return min(requested_n_jobs, visible_cpus)
 
 
 # ---------------------------------------------------------------------------
@@ -379,12 +391,38 @@ def _build_cat_mapping(series: pd.Series, max_codes: int | None) -> tuple[dict, 
     return {v: i for i, v in enumerate(kept_values)}, raw_cardinality
 
 
+def _build_and_write_chunk_task(task: tuple[int, np.ndarray]) -> tuple[int, int, int]:
+    """Worker task for parallel chunk build."""
+    import gc
+
+    idx, chunk_items = task
+    ctx = _BUILD_WORKER_CTX
+    if ctx is None:
+        raise RuntimeError("Build worker context not initialized.")
+
+    chunk_panel = _build_chunk_features(
+        chunk_items=chunk_items,
+        frame=ctx["frame"],  # type: ignore[index]
+        all_dates=ctx["all_dates"],  # type: ignore[index]
+        item_bounds=ctx["item_bounds"],  # type: ignore[index]
+        horizons=ctx["horizons"],  # type: ignore[index]
+        cat_mappings=ctx["cat_mappings"],  # type: ignore[index]
+    )
+    n_rows = len(chunk_panel)
+    out_path = Path(ctx["tmp_dir"]) / f"chunk_{idx:04d}.parquet"  # type: ignore[index]
+    chunk_panel.to_parquet(out_path, index=False)
+    del chunk_panel
+    gc.collect()
+    return idx, int(len(chunk_items)), int(n_rows)
+
+
 def build_featured_panel(
     frame: pd.DataFrame,
     eligible_items: np.ndarray,
     panel_days: int,
     horizons: list[int],
     max_cat_codes: int | None = None,
+    build_workers: int = 1,
     chunk_size: int = 20_000,
 ) -> tuple[Path, dict[str, dict[str, int]]]:
     """Build dense panel with features, writing chunks to parquet on disk.
@@ -434,29 +472,96 @@ def build_featured_panel(
     if truncated_cardinality:
         print(f"  Truncated categories (raw -> kept): {truncated_cardinality}")
 
+    if build_workers < 1:
+        raise ValueError("build_workers must be >= 1.")
+
     # Process in chunks — write each to parquet, free memory immediately
     tmp_dir = Path(tempfile.mkdtemp(prefix="book_predict_chunks_"))
     n_chunks = max(1, int(np.ceil(len(eligible_items) / chunk_size)))
     item_chunks = np.array_split(eligible_items, n_chunks)
 
     total_rows = 0
-    for i, chunk_items in enumerate(
-        _iter_with_progress(item_chunks, total=len(item_chunks), desc="Build chunks")
-    ):
-        chunk_panel = _build_chunk_features(
-            chunk_items, frame, all_dates, item_bounds, horizons,
-            cat_mappings=cat_mappings,
-        )
-        n_rows = len(chunk_panel)
-        total_rows += n_rows
-        chunk_panel.to_parquet(tmp_dir / f"chunk_{i:04d}.parquet", index=False)
-        del chunk_panel
-        gc.collect()
+    if build_workers == 1:
+        for i, chunk_items in enumerate(
+            _iter_with_progress(item_chunks, total=len(item_chunks), desc="Build chunks")
+        ):
+            chunk_panel = _build_chunk_features(
+                chunk_items, frame, all_dates, item_bounds, horizons,
+                cat_mappings=cat_mappings,
+            )
+            n_rows = len(chunk_panel)
+            total_rows += n_rows
+            chunk_panel.to_parquet(tmp_dir / f"chunk_{i:04d}.parquet", index=False)
+            del chunk_panel
+            gc.collect()
+            print(
+                f"  Chunk {i + 1}/{len(item_chunks)}: "
+                f"{len(chunk_items):,} items, {n_rows:,} rows "
+                f"(cumulative: {total_rows:,}) [RSS: {_mem_gb()}]"
+            )
+    else:
+        import multiprocessing as mp
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+
+        if os.name != "posix":
+            print("  build_workers>1 requires POSIX fork; falling back to build_workers=1.")
+            return build_featured_panel(
+                frame=frame,
+                eligible_items=eligible_items,
+                panel_days=panel_days,
+                horizons=horizons,
+                max_cat_codes=max_cat_codes,
+                build_workers=1,
+                chunk_size=chunk_size,
+            )
+
+        try:
+            mp_ctx = mp.get_context("fork")
+        except ValueError:
+            print("  multiprocessing fork context unavailable; falling back to build_workers=1.")
+            return build_featured_panel(
+                frame=frame,
+                eligible_items=eligible_items,
+                panel_days=panel_days,
+                horizons=horizons,
+                max_cat_codes=max_cat_codes,
+                build_workers=1,
+                chunk_size=chunk_size,
+            )
+
         print(
-            f"  Chunk {i + 1}/{len(item_chunks)}: "
-            f"{len(chunk_items):,} items, {n_rows:,} rows "
-            f"(cumulative: {total_rows:,}) [RSS: {_mem_gb()}]"
+            f"Building chunks in parallel with {build_workers} workers "
+            "(process-based; higher workers need more RAM)..."
         )
+        global _BUILD_WORKER_CTX
+        _BUILD_WORKER_CTX = {
+            "frame": frame,
+            "all_dates": all_dates,
+            "item_bounds": item_bounds,
+            "horizons": horizons,
+            "cat_mappings": cat_mappings,
+            "tmp_dir": str(tmp_dir),
+        }
+
+        try:
+            with ProcessPoolExecutor(max_workers=build_workers, mp_context=mp_ctx) as executor:
+                futures = [
+                    executor.submit(_build_and_write_chunk_task, (i, chunk_items))
+                    for i, chunk_items in enumerate(item_chunks)
+                ]
+
+                for future in _iter_with_progress(
+                    as_completed(futures), total=len(futures), desc="Build chunks (parallel)"
+                ):
+                    i, item_count, n_rows = future.result()
+                    total_rows += n_rows
+                    print(
+                        f"  Chunk {i + 1}/{len(item_chunks)}: "
+                        f"{item_count:,} items, {n_rows:,} rows "
+                        f"(cumulative: {total_rows:,}) [RSS: {_mem_gb()}]"
+                    )
+        finally:
+            _BUILD_WORKER_CTX = None
 
     print(f"  Total rows written: {total_rows:,} across {len(item_chunks)} parquet files")
 
@@ -682,6 +787,7 @@ def _finalize_metric_accumulator(acc: dict[str, float]) -> dict[str, float]:
 # ---------------------------------------------------------------------------
 
 def build_lgbm_params(config: LGBMTrainerConfig, device: str) -> dict:
+    effective_n_jobs = _resolve_n_jobs(config.n_jobs)
     params = {
         "objective": "regression_l1",      # MAE — robust to QTY outliers
         "metric": "mae",
@@ -696,7 +802,7 @@ def build_lgbm_params(config: LGBMTrainerConfig, device: str) -> dict:
         "lambda_l2": 1.0,
         "verbose": -1,
         "seed": config.random_state,
-        "n_jobs": config.n_jobs,
+        "n_jobs": effective_n_jobs,
     }
     if config.max_bin is not None:
         params["max_bin"] = int(config.max_bin)
@@ -921,15 +1027,17 @@ def run_training(config: LGBMTrainerConfig) -> list[dict[str, object]]:
         effective_max_cat_codes = 255
 
     visible_cpus = os.cpu_count() or 1
-    if config.n_jobs == -1:
+    effective_n_jobs = _resolve_n_jobs(config.n_jobs)
+    if config.n_jobs < -1:
+        thread_note = f"interpreted as {effective_n_jobs} (abs of n_jobs)"
+    elif config.n_jobs in (-1, 0):
         thread_note = "all visible logical cores"
-    elif config.n_jobs <= 0:
-        thread_note = "LightGBM/OpenMP default behavior"
     else:
-        thread_note = str(config.n_jobs)
+        thread_note = str(effective_n_jobs)
     print(
         f"Threading: n_jobs={config.n_jobs} "
-        f"(visible_cpus={visible_cpus}, effective={thread_note})"
+        f"(visible_cpus={visible_cpus}, effective={thread_note}) "
+        f"build_workers={config.build_workers}"
     )
     if config.device == "gpu":
         effective_max_bin = config.max_bin if config.max_bin is not None else (255 if config.gpu_safe else "default")
@@ -961,6 +1069,7 @@ def run_training(config: LGBMTrainerConfig) -> list[dict[str, object]]:
         panel_days=config.panel_days,
         horizons=config.horizons,
         max_cat_codes=effective_max_cat_codes,
+        build_workers=config.build_workers,
     )
     print(f"Chunk parquet directory: {chunk_dir} [RSS: {_mem_gb()}]")
     del sales
