@@ -423,7 +423,7 @@ def build_featured_panel(
     truncated_cardinality: dict[str, tuple[int, int]] = {}
     for col in CATEGORICAL_FEATURES:
         if col in frame.columns:
-            mapping, raw_cardinality = _build_cat_mapping(frame[col], max_cat_codes=max_cat_codes)
+            mapping, raw_cardinality = _build_cat_mapping(frame[col], max_codes=max_cat_codes)
         else:
             mapping, raw_cardinality = {}, 0
         cat_mappings[col] = mapping
