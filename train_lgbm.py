@@ -101,9 +101,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--device",
-        choices=["cpu", "gpu"],
+        choices=["cpu", "gpu", "cuda"],
         default="gpu",
-        help="LightGBM training device.",
+        help="LightGBM training device (`gpu`=OpenCL, `cuda`=CUDA).",
     )
     parser.add_argument(
         "--random-state",

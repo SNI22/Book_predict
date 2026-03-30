@@ -808,7 +808,7 @@ def build_lgbm_params(config: LGBMTrainerConfig, device: str) -> dict:
         params["max_bin"] = int(config.max_bin)
     if config.max_cat_threshold is not None:
         params["max_cat_threshold"] = int(config.max_cat_threshold)
-    if config.gpu_safe and device == "gpu":
+    if config.gpu_safe and device in {"gpu", "cuda"}:
         params.setdefault("max_bin", 255)
         params.setdefault("max_cat_threshold", 64)
     return params
@@ -820,14 +820,17 @@ def _train_booster_with_fallback(
     config: LGBMTrainerConfig,
     callbacks: list,
 ) -> tuple[lgb.Booster, float, str]:
-    """Train on the configured device, retrying on CPU if GPU training fails."""
+    """Train with backend fallback: cuda -> gpu -> cpu, gpu -> cpu, cpu only."""
     requested_device = config.device
-    attempt_order = [requested_device]
-    if requested_device == "gpu":
-        attempt_order.append("cpu")
+    if requested_device == "cuda":
+        attempt_order = ["cuda", "gpu", "cpu"]
+    elif requested_device == "gpu":
+        attempt_order = ["gpu", "cpu"]
+    else:
+        attempt_order = ["cpu"]
 
     last_error: Exception | None = None
-    for device in attempt_order:
+    for i, device in enumerate(attempt_order):
         params = build_lgbm_params(config, device)
         try:
             train_started = time.perf_counter()
@@ -842,10 +845,12 @@ def _train_booster_with_fallback(
             return booster, train_elapsed, device
         except lgb.basic.LightGBMError as exc:
             last_error = exc
-            if device != "gpu":
+            is_last_attempt = i == len(attempt_order) - 1
+            if is_last_attempt:
                 raise
-            print(f"  GPU training failed: {exc}")
-            print("  Falling back to CPU for this horizon.")
+            next_device = attempt_order[i + 1]
+            print(f"  {device.upper()} training failed: {exc}")
+            print(f"  Falling back to {next_device.upper()} for this horizon.")
 
     assert last_error is not None
     raise last_error
@@ -1023,7 +1028,7 @@ def run_training(config: LGBMTrainerConfig) -> list[dict[str, object]]:
     import gc
 
     effective_max_cat_codes = config.max_cat_codes
-    if config.gpu_safe and config.device == "gpu" and effective_max_cat_codes is None:
+    if config.gpu_safe and config.device in {"gpu", "cuda"} and effective_max_cat_codes is None:
         effective_max_cat_codes = 255
 
     visible_cpus = os.cpu_count() or 1
@@ -1039,7 +1044,7 @@ def run_training(config: LGBMTrainerConfig) -> list[dict[str, object]]:
         f"(visible_cpus={visible_cpus}, effective={thread_note}) "
         f"build_workers={config.build_workers}"
     )
-    if config.device == "gpu":
+    if config.device in {"gpu", "cuda"}:
         effective_max_bin = config.max_bin if config.max_bin is not None else (255 if config.gpu_safe else "default")
         effective_max_cat_threshold = (
             config.max_cat_threshold
@@ -1047,7 +1052,7 @@ def run_training(config: LGBMTrainerConfig) -> list[dict[str, object]]:
             else (64 if config.gpu_safe else "default")
         )
         print(
-            "GPU binning: "
+            f"{config.device.upper()} binning: "
             f"max_bin={effective_max_bin}, "
             f"max_cat_threshold={effective_max_cat_threshold}, "
             f"max_cat_codes={effective_max_cat_codes if effective_max_cat_codes is not None else 'unlimited'}"
