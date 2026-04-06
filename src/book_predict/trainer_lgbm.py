@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+import threading
 import time
 from typing import Iterable
 
@@ -39,6 +40,16 @@ def _iter_with_progress(iterable, total: int, desc: str):
 
 _FLOAT16_MAX = np.finfo(np.float16).max
 _BUILD_WORKER_CTX: dict[str, object] | None = None
+_thread_log_prefix = threading.local()
+
+
+def set_log_prefix(prefix: str) -> None:
+    """Set a per-thread log prefix (e.g. '[15d] ') for multi-GPU parallel runs."""
+    _thread_log_prefix.value = prefix
+
+
+def get_log_prefix() -> str:
+    return getattr(_thread_log_prefix, "value", "")
 
 
 def _to_float16_safe(values: pd.Series) -> pd.Series:
@@ -1200,6 +1211,7 @@ def run_training(config: LGBMTrainerConfig) -> list[dict[str, object]]:
         print(f"Multi-GPU mode: distributing {len(config.horizons)} horizons across GPUs 0–{len(config.horizons)-1}")
 
         def _train_on_gpu(horizon: int, gpu_id: int) -> dict[str, object]:
+            set_log_prefix(f"[{horizon}d] ")
             h_config = dataclasses.replace(config, gpu_device_id=gpu_id)
             result = train_for_horizon(chunk_dir, h_config, horizon, cat_mappings=cat_mappings)
             print(f"Finished horizon {horizon}d on GPU {gpu_id} [RSS: {_mem_gb()}]")

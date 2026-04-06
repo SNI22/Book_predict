@@ -6,7 +6,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from src.book_predict.trainer_lgbm import LGBMTrainerConfig, run_training
+from src.book_predict.trainer_lgbm import LGBMTrainerConfig, run_training, get_log_prefix
 
 
 def setup_logging(output_dir: Path, timestamp: str) -> None:
@@ -36,7 +36,8 @@ def setup_logging(output_dir: Path, timestamp: str) -> None:
     class _LogStream:
         def write(self, msg: str) -> None:
             if msg.strip():
-                logging.info(msg.rstrip())
+                prefix = get_log_prefix()
+                logging.info(f"{prefix}{msg.rstrip()}")
         def flush(self) -> None:
             for h in root.handlers:
                 h.flush()
