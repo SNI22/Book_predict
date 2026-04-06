@@ -3,6 +3,7 @@ __pycache__/
 *.pyo
 *.joblib
 artifacts*/
+dataset_large/
 *.egg-info/
 .eggs/
 dist/
