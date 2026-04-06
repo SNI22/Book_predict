@@ -9,14 +9,13 @@ from pathlib import Path
 from src.book_predict.trainer_lgbm import LGBMTrainerConfig, run_training
 
 
-def setup_logging(output_dir: Path) -> None:
+def setup_logging(output_dir: Path, timestamp: str) -> None:
     """Configure logging to both console and a timestamped log file.
 
     Uses line-buffering so the log file stays current even if the process
     is killed (e.g. OOM).
     """
     output_dir.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_path = output_dir / f"train_{timestamp}.log"
 
     # Unbuffered file handler
@@ -100,6 +99,13 @@ def parse_args() -> argparse.Namespace:
              "With 250M+ rows, 20-30M is usually sufficient for LightGBM.",
     )
     parser.add_argument(
+        "--recent-days",
+        type=int,
+        default=365,
+        help="Rows within this many days of train_end are kept at full rate when subsampling. "
+             "Older rows fill the remaining budget. Default: 365.",
+    )
+    parser.add_argument(
         "--device",
         choices=["cpu", "gpu", "cuda"],
         default="gpu",
@@ -140,6 +146,13 @@ def parse_args() -> argparse.Namespace:
         help="Enable GPU-safe defaults: max_bin=255, max_cat_threshold=64, max_cat_codes=255 (unless overridden).",
     )
     parser.add_argument(
+        "--gpu-device-id",
+        type=int,
+        default=None,
+        help="Pin all horizons to a specific GPU device ID. "
+             "Default: auto-assign horizon[i] to GPU[i] when multiple horizons and GPU device.",
+    )
+    parser.add_argument(
         "--build-workers",
         type=int,
         default=1,
@@ -150,17 +163,20 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    output_dir = args.output_dir or Path("artifacts_lgbm")
-    setup_logging(output_dir)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    base_dir = args.output_dir or Path("artifacts_lgbm")
+    run_dir = base_dir / timestamp
+    setup_logging(run_dir, timestamp)
     config = LGBMTrainerConfig(
         txn_path=args.txn_path,
         meta_path=args.meta_path,
-        output_dir=args.output_dir,
+        output_dir=run_dir,
         horizons=args.horizons,
         min_history_days=args.min_history_days,
         panel_days=args.panel_days,
         max_items=args.max_items,
         max_train_rows=args.max_train_rows,
+        recent_days=args.recent_days,
         device=args.device,
         random_state=args.random_state,
         n_jobs=args.n_jobs,
@@ -169,6 +185,7 @@ def main() -> None:
         max_cat_codes=args.max_cat_codes,
         gpu_safe=args.gpu_safe,
         build_workers=args.build_workers,
+        gpu_device_id=args.gpu_device_id,
     )
     results = run_training(config)
     print("\n=== Summary ===")

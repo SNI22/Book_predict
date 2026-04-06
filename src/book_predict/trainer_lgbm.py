@@ -119,6 +119,7 @@ class LGBMTrainerConfig:
     panel_days: int = 730
     max_items: int | None = None
     max_train_rows: int | None = None          # cap training rows (subsample if exceeded)
+    recent_days: int = 365                     # rows within this many days of train_end are kept at full rate
     device: str = "gpu"
     random_state: int = 42
     n_jobs: int = -1
@@ -127,6 +128,7 @@ class LGBMTrainerConfig:
     max_cat_codes: int | None = None
     gpu_safe: bool = False
     build_workers: int = 1
+    gpu_device_id: int | None = None    # None = auto-assign (horizon 0→GPU0, horizon 1→GPU1, …)
 
 
 def _resolve_n_jobs(requested_n_jobs: int) -> int:
@@ -741,6 +743,7 @@ def _write_train_valid_files(
     staging_dir: Path,
     *,
     max_train_rows: int | None,
+    recent_days: int,
     random_state: int,
 ) -> tuple[Path, Path, int, int, int]:
     import gc
@@ -750,16 +753,39 @@ def _write_train_valid_files(
     train_path = staging_dir / f"train_{horizon}d.csv"
     valid_path = staging_dir / f"valid_{horizon}d.csv"
 
-    train_rows_target: int | None = None
-    keep_probability = 1.0
+    recent_cutoff = train_end - pd.Timedelta(days=recent_days)
+    recent_keep_prob = 1.0
+    old_keep_prob = 1.0
+
     if max_train_rows is not None:
-        train_rows_target, _, _ = _count_split_rows(chunk_dir, horizon, train_end, valid_end)
-        if train_rows_target > max_train_rows:
-            keep_probability = max_train_rows / train_rows_target
+        # Count recent vs old train rows in one pass
+        recent_count = 0
+        old_count = 0
+        for chunk in _iter_filtered_chunks(
+            chunk_dir, horizon, include_ids=False, desc=f"Count {horizon}d"
+        ):
+            train_mask = chunk["XSRQ"] <= train_end
+            recent_count += int((train_mask & (chunk["XSRQ"] > recent_cutoff)).sum())
+            old_count += int((train_mask & (chunk["XSRQ"] <= recent_cutoff)).sum())
+
+        total_count = recent_count + old_count
+        if total_count <= max_train_rows:
+            print(f"  Training row cap for {horizon}d: {total_count:,} <= {max_train_rows:,}, keeping all")
+        elif recent_count >= max_train_rows:
+            # Recent data alone exceeds cap — sample uniformly from recent, drop all old
+            recent_keep_prob = max_train_rows / recent_count
+            old_keep_prob = 0.0
             print(
-                f"  Training row cap for {horizon}d: "
-                f"{train_rows_target:,} -> about {max_train_rows:,} "
-                f"(keep_probability={keep_probability:.4f})"
+                f"  [temporal sampling {horizon}d] recent({recent_days}d)={recent_count:,} > cap={max_train_rows:,}; "
+                f"sample recent at {recent_keep_prob:.4f}, drop old"
+            )
+        else:
+            # Keep all recent, fill remaining budget from old
+            old_keep_prob = (max_train_rows - recent_count) / max(old_count, 1)
+            print(
+                f"  [temporal sampling {horizon}d] keep all recent({recent_days}d)={recent_count:,}, "
+                f"sample old={old_count:,} at {old_keep_prob:.4f} "
+                f"(total target ~{max_train_rows:,})"
             )
 
     written_train = 0
@@ -773,8 +799,10 @@ def _write_train_valid_files(
         chunk_dir, horizon, include_ids=False, desc=f"Stage {horizon}d"
     ):
         train_chunk = chunk[chunk["XSRQ"] <= train_end]
-        if keep_probability < 1.0 and len(train_chunk) > 0:
-            mask = rng.random(len(train_chunk)) < keep_probability
+        if len(train_chunk) > 0 and (recent_keep_prob < 1.0 or old_keep_prob < 1.0):
+            is_recent = train_chunk["XSRQ"] > recent_cutoff
+            probs = np.where(is_recent, recent_keep_prob, old_keep_prob)
+            mask = rng.random(len(train_chunk)) < probs
             train_chunk = train_chunk.loc[mask]
         valid_chunk = chunk[(chunk["XSRQ"] > train_end) & (chunk["XSRQ"] <= valid_end)]
         seen_test += int((chunk["XSRQ"] > valid_end).sum())
@@ -886,6 +914,8 @@ def build_lgbm_params(config: LGBMTrainerConfig, device: str) -> dict:
     if config.gpu_safe and device in {"gpu", "cuda"}:
         params.setdefault("max_bin", 255)
         params.setdefault("max_cat_threshold", 64)
+    if config.gpu_device_id is not None and device in {"gpu", "cuda"}:
+        params["gpu_device_id"] = config.gpu_device_id
     return params
 
 
@@ -1017,6 +1047,7 @@ def train_for_horizon(
         valid_end,
         staging_dir,
         max_train_rows=config.max_train_rows,
+        recent_days=config.recent_days,
         random_state=config.random_state,
     )
 
@@ -1156,11 +1187,40 @@ def run_training(config: LGBMTrainerConfig) -> list[dict[str, object]]:
     gc.collect()
     print(f"Freed sales data [RSS: {_mem_gb()}]")
 
-    results = []
-    for horizon in config.horizons:
-        results.append(train_for_horizon(chunk_dir, config, horizon, cat_mappings=cat_mappings))
-        gc.collect()
-        print(f"Finished horizon {horizon}d [RSS: {_mem_gb()}]")
+    use_multi_gpu = (
+        config.device in {"gpu", "cuda"}
+        and len(config.horizons) > 1
+        and config.gpu_device_id is None   # manual override disables auto-assign
+    )
+
+    if use_multi_gpu:
+        import dataclasses
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        print(f"Multi-GPU mode: distributing {len(config.horizons)} horizons across GPUs 0–{len(config.horizons)-1}")
+
+        def _train_on_gpu(horizon: int, gpu_id: int) -> dict[str, object]:
+            h_config = dataclasses.replace(config, gpu_device_id=gpu_id)
+            result = train_for_horizon(chunk_dir, h_config, horizon, cat_mappings=cat_mappings)
+            print(f"Finished horizon {horizon}d on GPU {gpu_id} [RSS: {_mem_gb()}]")
+            return result
+
+        with ThreadPoolExecutor(max_workers=len(config.horizons)) as executor:
+            futures = {
+                executor.submit(_train_on_gpu, horizon, gpu_id): horizon
+                for gpu_id, horizon in enumerate(config.horizons)
+            }
+            horizon_results = {}
+            for future in as_completed(futures):
+                result = future.result()
+                horizon_results[result["horizon"]] = result
+        results = [horizon_results[h] for h in config.horizons]
+    else:
+        results = []
+        for horizon in config.horizons:
+            results.append(train_for_horizon(chunk_dir, config, horizon, cat_mappings=cat_mappings))
+            gc.collect()
+            print(f"Finished horizon {horizon}d [RSS: {_mem_gb()}]")
 
     summary = []
     for r in results:

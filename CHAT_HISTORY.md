@@ -517,3 +517,78 @@ Comparison of `artifacts_lgbm_3yr` runs before vs after fix (same 3yr panel, sam
 ### Remaining Known Issue (P2)
 
 Category rolling features (`category_roll_mean_28`, `category_yoy_ratio`) are computed on sale-event dates rather than calendar days. For sparse categories, zero-sale days drop out of the rolling window, making the "28-day" window span more than 28 calendar days. `item_share_of_category` also blows up on zero-sale merge dates. Fix requires reindexing `cat_daily` to a full dense date range per category — deferred to next iteration.
+
+---
+
+## Addendum — 2026-04-06 (Temporal Subsampling + Multi-GPU + Output Structure)
+
+### Temporal Subsampling
+
+**Problem:** `--max-train-rows 30000000` applied uniform random sampling across all 3yr training rows (~200M). With a 3yr panel, the most recent 30 days got the same sparse sampling (~7.7%) as data from 2 years ago, causing the model to undertrain on the distribution closest to test time.
+
+**Fix:** Time-aware sampling with a `recent_days` window (default 365):
+- Rows within the last `recent_days` of `train_end` are kept at full rate
+- Older rows fill the remaining budget at a lower rate
+- If recent rows alone exceed the cap, sample uniformly from the recent window only — still better than uniform across all 3 years
+
+**New CLI flag:** `--recent-days N` (default 365)
+
+**Implementation:** Modified `_write_train_valid_files` in `trainer_lgbm.py`:
+- One count pass: tallies `recent_count` and `old_count` separately
+- Computes `recent_keep_prob` and `old_keep_prob` with the budget math
+- Write pass: applies per-row probability via `np.where(is_recent, recent_keep_prob, old_keep_prob)`
+
+### Multi-GPU Parallel Horizon Training
+
+**Problem:** With 4× RTX A4000 GPUs (16GB VRAM each, CUDA 12.2), horizons were trained sequentially on a single GPU, leaving 3 idle.
+
+**Fix:** When `--device cuda` or `--device gpu` and multiple horizons are requested, horizons are automatically distributed across GPUs:
+- horizon[0] (15d) → GPU 0
+- horizon[1] (30d) → GPU 1
+- Uses `ThreadPoolExecutor` — LightGBM's C++ releases the GIL so threads are safe
+- Parquet staging goes to separate tmpdirs per horizon (no conflicts)
+- Auto-assign disabled when `--gpu-device-id` is set manually
+
+**New config field / CLI flag:** `gpu_device_id: int | None` / `--gpu-device-id N`
+
+**Smoke test result (2K items):** CPU: 24s/23s per horizon sequentially → CUDA multi-GPU: 11.9s/12.4s in parallel.
+
+### CUDA Installation
+
+The default PyPI `lightgbm` package is CPU-only. CUDA-enabled build installed via conda-forge:
+
+```bash
+conda install -n book_predict -c conda-forge lightgbm=4.6.0=cuda_py_4 -y
+```
+
+### Timestamped Output Structure
+
+**Problem:** Each run overwrote the previous `horizon_15d/` and `horizon_30d/` directories.
+
+**Fix:** Each run now creates a timestamped subfolder: `<output-dir>/YYYYMMDD_HHMMSS/`
+
+```
+artifacts_lgbm_3yr_cuda/
+  20260406_033625/
+    train_20260406_033625.log
+    training_summary.csv
+    horizon_15d/  model.lgb, metrics.csv, feature_importance.csv, test_predictions.csv, model_meta.joblib
+    horizon_30d/  (same)
+```
+
+**Implementation:** `train_lgbm.py` generates timestamp at startup, creates `base_dir / timestamp` as `run_dir`, passes that to both `setup_logging` and `LGBMTrainerConfig.output_dir`.
+
+### Current Best Run Command (CUDA, 3yr panel)
+
+```bash
+conda run -n book_predict python -u train_lgbm.py --txn-path ./dataset_large/TMPNXJ202603271.csv --meta-path ./dataset_large/TMPNXJ202603272.csv --output-dir artifacts_lgbm_3yr_cuda --horizons 15 30 --min-history-days 10 --panel-days 1095 --max-train-rows 30000000 --device cuda --gpu-safe --n-jobs -1 --build-workers 16 --random-state 42
+```
+
+### Known Remaining Issues (Next Iteration)
+
+| # | Issue | Impact |
+|---|-------|--------|
+| P2 | Category rolling features computed on sale-event dates, not calendar days | Medium — affects sparse categories |
+| - | `is_weekend`, `lag_14`, `lag_28`, `primary_channel`, `DLNUM` near-zero feature importance | Low — cleanup |
+| - | `store_count_7`, `store_count_14` not yet added (#1 feature is `store_count_28`) | Medium |
+| - | `min_history_days=10` too low — items with <30 days have mostly NaN features | Medium |
