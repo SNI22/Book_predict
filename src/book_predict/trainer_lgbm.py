@@ -1034,22 +1034,18 @@ def _evaluate_streaming_splits(
 # Per-horizon training
 # ---------------------------------------------------------------------------
 
-def train_for_horizon(
+def _stage_for_horizon(
     chunk_dir: Path, config: LGBMTrainerConfig, horizon: int,
-    cat_mappings: dict[str, dict[str, int]] | None = None,
-) -> dict[str, object]:
-    """Train a LightGBM model for a single horizon.
+) -> tuple[Path, Path, Path, int, pd.Timestamp, pd.Timestamp]:
+    """I/O phase: determine splits and write staged train/valid CSV files.
 
-    Trains from staged on-disk files to avoid concatenating all rows in RAM.
+    Returns (staging_dir, train_path, valid_path, train_rows, train_end, valid_end).
+    Run this sequentially across all horizons before launching parallel GPU training.
     """
-    import gc
-    import shutil
     import tempfile
 
-    print(f"\n--- Horizon {horizon}d ---")
-    target_col = f"target_{horizon}d"
+    print(f"\n--- Staging {horizon}d ---")
     train_end, valid_end = _determine_split_dates(chunk_dir, horizon)
-
     staging_dir = Path(tempfile.mkdtemp(prefix=f"book_predict_stage_{horizon}d_"))
     train_path, valid_path, train_rows, _, _ = _write_train_valid_files(
         chunk_dir,
@@ -1061,6 +1057,42 @@ def train_for_horizon(
         recent_days=config.recent_days,
         random_state=config.random_state,
     )
+    return staging_dir, train_path, valid_path, train_rows, train_end, valid_end
+
+
+def train_for_horizon(
+    chunk_dir: Path, config: LGBMTrainerConfig, horizon: int,
+    cat_mappings: dict[str, dict[str, int]] | None = None,
+    staged: tuple[Path, Path, Path, int, pd.Timestamp, pd.Timestamp] | None = None,
+) -> dict[str, object]:
+    """Train a LightGBM model for a single horizon.
+
+    If `staged` is provided (from _stage_for_horizon), the I/O staging phase is
+    skipped and training starts immediately — use this for parallel GPU training
+    after all horizons have been staged sequentially.
+    """
+    import gc
+    import shutil
+    import tempfile
+
+    print(f"\n--- Horizon {horizon}d ---")
+    target_col = f"target_{horizon}d"
+
+    if staged is not None:
+        staging_dir, train_path, valid_path, train_rows, train_end, valid_end = staged
+    else:
+        train_end, valid_end = _determine_split_dates(chunk_dir, horizon)
+        staging_dir = Path(tempfile.mkdtemp(prefix=f"book_predict_stage_{horizon}d_"))
+        train_path, valid_path, train_rows, _, _ = _write_train_valid_files(
+            chunk_dir,
+            horizon,
+            train_end,
+            valid_end,
+            staging_dir,
+            max_train_rows=config.max_train_rows,
+            recent_days=config.recent_days,
+            random_state=config.random_state,
+        )
 
     # Tell LightGBM which columns are categorical (they're int16-encoded)
     cat_feature_indices = [ALL_FEATURES.index(c) for c in CATEGORICAL_FEATURES]
@@ -1208,12 +1240,19 @@ def run_training(config: LGBMTrainerConfig) -> list[dict[str, object]]:
         import dataclasses
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
-        print(f"Multi-GPU mode: distributing {len(config.horizons)} horizons across GPUs 0–{len(config.horizons)-1}")
+        # Stage all horizons sequentially to avoid concurrent parquet reads on the
+        # same /tmp files (which serializes I/O and makes parallel staging slower
+        # than sequential staging).
+        print(f"Multi-GPU mode: staging {len(config.horizons)} horizons sequentially, then training in parallel on GPUs 0–{len(config.horizons)-1}")
+        staged_data = {}
+        for horizon in config.horizons:
+            staged_data[horizon] = _stage_for_horizon(chunk_dir, config, horizon)
+            gc.collect()
 
         def _train_on_gpu(horizon: int, gpu_id: int) -> dict[str, object]:
             set_log_prefix(f"[{horizon}d] ")
             h_config = dataclasses.replace(config, gpu_device_id=gpu_id)
-            result = train_for_horizon(chunk_dir, h_config, horizon, cat_mappings=cat_mappings)
+            result = train_for_horizon(chunk_dir, h_config, horizon, cat_mappings=cat_mappings, staged=staged_data[horizon])
             print(f"Finished horizon {horizon}d on GPU {gpu_id} [RSS: {_mem_gb()}]")
             return result
 
