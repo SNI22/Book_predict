@@ -58,6 +58,7 @@ STATIC_COLUMNS = [
     "BPDNAME",
     "DLNUM",
     "DLNAME",
+    "UN_NUMBER",
 ]
 
 CATEGORICAL_FEATURES = [
@@ -65,6 +66,7 @@ CATEGORICAL_FEATURES = [
     "ITEM_CATEORY",
     "BPDNAME",
     "DLNAME",
+    "UN_NUMBER",
     "primary_store",
     "primary_channel",
 ]
@@ -74,20 +76,29 @@ NUMERIC_FEATURES = [
     "DLNUM",
     # short-term lags
     "lag_1", "lag_7", "lag_14", "lag_28",
+    # medium/long lags
+    "lag_91", "lag_182",
     # rolling sums / means
-    "roll_sum_7", "roll_sum_14", "roll_sum_28",
-    "roll_mean_7", "roll_mean_14", "roll_mean_28",
+    "roll_sum_7", "roll_sum_14", "roll_sum_28", "roll_sum_91",
+    "roll_mean_7", "roll_mean_14", "roll_mean_28", "roll_mean_91",
     "nonzero_days_28",
     "days_since_sale",
     # year-over-year
     "lag_365",
     "roll_mean_28_yoy",
+    # derived ratios
+    "velocity_ratio",
+    "yoy_ratio",
     # revenue-derived
     "avg_revenue_per_unit_28",
     "store_count_28",
+    # category-level
+    "category_roll_mean_28",
+    "item_share_of_category",
+    "category_yoy_ratio",
     # calendar
-    "day_of_week", "day_of_month", "month", "week_of_year",
-    "is_month_start", "is_month_end",
+    "day_of_month", "month", "week_of_year",
+    "is_weekend", "quarter",
     "item_age_days",
 ]
 
@@ -146,6 +157,9 @@ def load_and_aggregate_sales(config: LGBMTrainerConfig) -> pd.DataFrame:
         config.meta_path,
         encoding="utf-8-sig",
         dtype={"INVENTORY_ITEM_ID": "int64"},
+        usecols=["INVENTORY_ITEM_ID", "LIST_PRICE_PER_UNIT",
+                 "ITEM_CATEORY_CODE", "ITEM_CATEORY",
+                 "BPDNAME", "DLNUM", "DLNAME", "UN_NUMBER"],
     )
 
     # Fill metadata nulls
@@ -154,6 +168,7 @@ def load_and_aggregate_sales(config: LGBMTrainerConfig) -> pd.DataFrame:
         ("ITEM_CATEORY_CODE", "UNKNOWN_CATEGORY_CODE"),
         ("ITEM_CATEORY", "UNKNOWN_CATEGORY"),
         ("DLNAME", "UNKNOWN_DLNAME"),
+        ("UN_NUMBER", "UNKNOWN_UN"),
     ]:
         meta[col] = meta[col].fillna(fill)
 
@@ -207,6 +222,7 @@ def load_and_aggregate_sales(config: LGBMTrainerConfig) -> pd.DataFrame:
         ("ITEM_CATEORY_CODE", "UNKNOWN_CATEGORY_CODE"),
         ("ITEM_CATEORY", "UNKNOWN_CATEGORY"),
         ("DLNAME", "UNKNOWN_DLNAME"),
+        ("UN_NUMBER", "UNKNOWN_UN"),
         ("LIST_PRICE_PER_UNIT", 0.0),
         ("DLNUM", 0),
     ]:
@@ -245,6 +261,7 @@ def _build_chunk_features(
     item_bounds: pd.DataFrame,
     horizons: list[int],
     cat_mappings: dict[str, dict[str, int]] | None = None,
+    cat_features_df: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Build dense panel for a subset of items AND compute all features in-place.
 
@@ -285,6 +302,8 @@ def _build_chunk_features(
     panel["lag_7"] = g["QTY"].shift(7)
     panel["lag_14"] = g["QTY"].shift(14)
     panel["lag_28"] = g["QTY"].shift(28)
+    panel["lag_91"] = g["QTY"].shift(91)
+    panel["lag_182"] = g["QTY"].shift(182)
     panel["lag_365"] = g["QTY"].shift(365)
 
     # Rolling (on lag-1 shifted series to avoid leakage)
@@ -293,15 +312,25 @@ def _build_chunk_features(
     panel["roll_sum_7"] = rg.transform(lambda s: s.rolling(7, min_periods=7).sum())
     panel["roll_sum_14"] = rg.transform(lambda s: s.rolling(14, min_periods=14).sum())
     panel["roll_sum_28"] = rg.transform(lambda s: s.rolling(28, min_periods=28).sum())
+    panel["roll_sum_91"] = rg.transform(lambda s: s.rolling(91, min_periods=45).sum())
     panel["roll_mean_7"] = panel["roll_sum_7"] / 7.0
     panel["roll_mean_14"] = panel["roll_sum_14"] / 14.0
     panel["roll_mean_28"] = panel["roll_sum_28"] / 28.0
+    panel["roll_mean_91"] = panel["roll_sum_91"] / 91.0
     panel["nonzero_days_28"] = rg.transform(lambda s: s.gt(0).rolling(28, min_periods=28).sum())
+    # Velocity ratio: short-term vs medium-term trend (is item accelerating?)
+    panel["velocity_ratio"] = panel["roll_mean_7"] / (panel["roll_mean_28"] + 1e-6)
 
     # Year-over-year rolling mean
     shifted_yoy = g["QTY"].shift(365)
     rg_yoy = shifted_yoy.groupby(panel["INVENTORY_ITEM_ID"], sort=False)
     panel["roll_mean_28_yoy"] = rg_yoy.transform(lambda s: s.rolling(28, min_periods=14).mean())
+    # YoY growth ratio: normalised signal (zero when yoy is absent)
+    panel["yoy_ratio"] = np.where(
+        panel["roll_mean_28_yoy"].notna(),
+        panel["roll_mean_28"] / (panel["roll_mean_28_yoy"] + 1e-6),
+        0.0,
+    )
 
     # Days since last sale
     prior = panel["XSRQ"].where(panel["QTY"] > 0)
@@ -325,13 +354,23 @@ def _build_chunk_features(
 
     # Calendar features
     cal = panel["XSRQ"].dt
-    panel["day_of_week"] = cal.dayofweek.astype("int8")
     panel["day_of_month"] = cal.day.astype("int8")
     panel["month"] = cal.month.astype("int8")
+    panel["quarter"] = cal.quarter.astype("int8")
     panel["week_of_year"] = _to_float16_safe(cal.isocalendar().week.astype("Int16"))
-    panel["is_month_start"] = cal.is_month_start.astype("int8")
-    panel["is_month_end"] = cal.is_month_end.astype("int8")
+    panel["is_weekend"] = (cal.dayofweek >= 5).astype("int8")
     panel["item_age_days"] = _to_float16_safe((panel["XSRQ"] - panel["first_sale_date"]).dt.days)
+
+    # --- category-level features (joined from pre-computed category aggregates) ---
+    if cat_features_df is not None:
+        panel = panel.merge(cat_features_df, on=["ITEM_CATEORY", "XSRQ"], how="left")
+        panel["item_share_of_category"] = (
+            panel["roll_mean_28"] / (panel["category_roll_mean_28"].fillna(0) + 1e-6)
+        )
+    else:
+        panel["category_roll_mean_28"] = np.nan
+        panel["item_share_of_category"] = np.nan
+        panel["category_yoy_ratio"] = np.nan
 
     # --- drop intermediates to free memory ---
     panel.drop(columns=["XSJE", "store_count", "first_sale_date", "QTY"], inplace=True)
@@ -342,22 +381,27 @@ def _build_chunk_features(
             mapping = cat_mappings[col]
             panel[col] = panel[col].map(mapping).fillna(-1).astype("int16")
 
-    # --- quantize: keep higher-range means in float32, small counters in float16 ---
-    # Some rolling means can still exceed float16 max (65504) on popular items.
+    # --- quantize: keep higher-range values in float32, small bounded ratios in float16 ---
     float16_cols = [
         "nonzero_days_28",
         "store_count_28",
+        # ratios are bounded (typically 0–10), safe for float16
+        "velocity_ratio",
+        "yoy_ratio",
+        "item_share_of_category",
+        "category_yoy_ratio",
     ]
     for col in float16_cols:
         panel[col] = _to_float16_safe(panel[col])
 
-    # float32 for cols that can exceed 65504 (sums, lags, revenue)
+    # float32 for cols that can exceed 65504 (sums, lags, revenue, category aggregates)
     float32_cols = [
-        "lag_1", "lag_7", "lag_14", "lag_28", "lag_365",
-        "roll_sum_7", "roll_sum_14", "roll_sum_28",
-        "roll_mean_7", "roll_mean_14", "roll_mean_28",
+        "lag_1", "lag_7", "lag_14", "lag_28", "lag_91", "lag_182", "lag_365",
+        "roll_sum_7", "roll_sum_14", "roll_sum_28", "roll_sum_91",
+        "roll_mean_7", "roll_mean_14", "roll_mean_28", "roll_mean_91",
         "roll_mean_28_yoy",
         "avg_revenue_per_unit_28",
+        "category_roll_mean_28",
     ]
     for col in float32_cols:
         panel[col] = panel[col].astype("float32")
@@ -407,6 +451,7 @@ def _build_and_write_chunk_task(task: tuple[int, np.ndarray]) -> tuple[int, int,
         item_bounds=ctx["item_bounds"],  # type: ignore[index]
         horizons=ctx["horizons"],  # type: ignore[index]
         cat_mappings=ctx["cat_mappings"],  # type: ignore[index]
+        cat_features_df=ctx.get("cat_features_df"),  # type: ignore[index]
     )
     n_rows = len(chunk_panel)
     out_path = Path(ctx["tmp_dir"]) / f"chunk_{idx:04d}.parquet"  # type: ignore[index]
@@ -472,6 +517,34 @@ def build_featured_panel(
     if truncated_cardinality:
         print(f"  Truncated categories (raw -> kept): {truncated_cardinality}")
 
+    # --- category-level rolling features (computed once, joined per chunk) ---
+    print("Computing category-level rolling features...")
+    cat_daily = (
+        frame.groupby(["ITEM_CATEORY", "XSRQ"])["QTY"]
+        .sum()
+        .reset_index()
+        .sort_values(["ITEM_CATEORY", "XSRQ"])
+    )
+    cat_grp = cat_daily.groupby("ITEM_CATEORY", sort=False)
+    cat_daily["category_roll_mean_28"] = (
+        cat_grp["QTY"]
+        .transform(lambda s: s.shift(1).rolling(28, min_periods=14).mean())
+        .astype("float32")
+    )
+    cat_daily["cat_roll_mean_28_yoy"] = (
+        cat_grp["QTY"]
+        .transform(lambda s: s.shift(365).rolling(28, min_periods=14).mean())
+        .astype("float32")
+    )
+    cat_daily["category_yoy_ratio"] = (
+        cat_daily["category_roll_mean_28"] / (cat_daily["cat_roll_mean_28_yoy"] + 1e-6)
+    ).astype("float32")
+    cat_features_df = cat_daily[
+        ["ITEM_CATEORY", "XSRQ", "category_roll_mean_28", "category_yoy_ratio"]
+    ].copy()
+    del cat_daily
+    print(f"  Category features shape: {cat_features_df.shape} [RSS: {_mem_gb()}]")
+
     if build_workers < 1:
         raise ValueError("build_workers must be >= 1.")
 
@@ -488,6 +561,7 @@ def build_featured_panel(
             chunk_panel = _build_chunk_features(
                 chunk_items, frame, all_dates, item_bounds, horizons,
                 cat_mappings=cat_mappings,
+                cat_features_df=cat_features_df,
             )
             n_rows = len(chunk_panel)
             total_rows += n_rows
@@ -540,6 +614,7 @@ def build_featured_panel(
             "item_bounds": item_bounds,
             "horizons": horizons,
             "cat_mappings": cat_mappings,
+            "cat_features_df": cat_features_df,
             "tmp_dir": str(tmp_dir),
         }
 
@@ -792,9 +867,9 @@ def build_lgbm_params(config: LGBMTrainerConfig, device: str) -> dict:
         "objective": "regression_l1",      # MAE — robust to QTY outliers
         "metric": "mae",
         "device": device,
-        "learning_rate": 0.05,
-        "num_leaves": 255,
-        "min_child_samples": 200,
+        "learning_rate": 0.03,
+        "num_leaves": 511,
+        "min_child_samples": 50,
         "feature_fraction": 0.8,
         "bagging_fraction": 0.8,
         "bagging_freq": 5,
@@ -837,7 +912,7 @@ def _train_booster_with_fallback(
             booster = lgb.train(
                 params,
                 dtrain,
-                num_boost_round=1000,
+                num_boost_round=2000,
                 valid_sets=[dvalid],
                 callbacks=callbacks,
             )

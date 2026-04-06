@@ -383,3 +383,137 @@ cd ~/Documents/book_predict_lgbm && conda run -n book_predict python -u train_lg
   --max-train-rows 30000000 \
   --output-dir artifacts_lgbm_30m_gpu_safe
 ```
+
+---
+
+## Addendum — 2026-04-05 (Metadata Column Pruning)
+
+### Dropped Columns from Metadata Load
+
+`DESCRIPTION`, `ISBN`, and `UN_NUMBER` are now excluded from the metadata CSV read via `usecols` in `load_and_aggregate_sales()`. These columns were previously loaded as strings, joined into `agg`, and carried through the entire build pipeline without ever being used as features.
+
+| Column | What it is | Why dropped |
+|--------|-----------|-------------|
+| `DESCRIPTION` | Book title string (Chinese text) | Never used as a feature; large string per item |
+| `ISBN` | International Standard Book Number | Never used as a feature |
+| `UN_NUMBER` | Numeric subject classification code (Chinese library taxonomy, e.g. `112` = National Standards, `5502` = Ethics) | More granular than `ITEM_CATEORY_CODE` but not yet added as a feature |
+
+**Note on `UN_NUMBER`:** This could be a useful categorical feature in future — it appears to encode finer-grained subject classification than the existing `ITEM_CATEORY_CODE` (~50 levels). Worth adding back if subject-level granularity is found to be underfit.
+
+---
+
+## Addendum — 2026-04-05 (Feature Expansion + Hyperparameter Tuning)
+
+### Motivation
+
+3yr run (`artifacts_lgbm_3yr`) completed with improved results vs 2yr baseline:
+- 15d: test WAPE 0.6821 → 0.6608 (+3.1%)
+- 30d: test WAPE 0.6384 → 0.6196 (+3.0%)
+
+Key observations from feature importance:
+- `days_since_sale` remains overwhelmingly #1
+- `is_month_start` and `is_month_end` showed 0.0 importance in all runs → dropped
+- `day_of_week` near-zero importance → replaced with `is_weekend`
+- 30d horizon lacks long-window features aligned to its prediction horizon
+
+### Changes Implemented
+
+#### New Features
+
+**Category-level dynamic features** (computed once from full frame before chunk loop, joined per chunk):
+- `category_roll_mean_28` — average daily QTY across all items in the same `ITEM_CATEORY` over last 28 days (shift(1) to avoid leakage). Captures "philosophy books are trending up this month".
+- `item_share_of_category` — `roll_mean_28 / (category_roll_mean_28 + 1e-6)`. Item's share of its category's recent sales.
+- `category_yoy_ratio` — category-level YoY growth rate. Especially useful for sparse items with weak personal history.
+
+**Longer lags and rolling windows** (aligned to 30d horizon):
+- `lag_91`, `lag_182` — quarterly and semi-annual lags
+- `roll_sum_91`, `roll_mean_91` — 91-day rolling window
+
+**Derived ratios:**
+- `velocity_ratio` = `roll_mean_7 / (roll_mean_28 + 1e-6)` — is item accelerating or decelerating?
+- `yoy_ratio` = `roll_mean_28 / (roll_mean_28_yoy + 1e-6)` — normalised YoY growth signal
+
+**UN_NUMBER added as categorical** — finer-grained subject classification code (e.g. `5502` = Ethics). More granular than `ITEM_CATEORY_CODE` (~50 levels).
+
+#### Dropped Features
+- `is_month_start`, `is_month_end` — 0.0 feature importance in all runs
+- `day_of_week` — near-zero importance; replaced by `is_weekend` (binary, more signal-dense)
+
+#### New Calendar Features
+- `is_weekend` = `(dayofweek >= 5).astype("int8")`
+- `quarter` = `cal.quarter.astype("int8")` — captures book sales seasonality (e.g. exam cycles)
+
+#### Hyperparameter Changes
+
+| Parameter | Before | After | Reason |
+|-----------|--------|-------|--------|
+| `num_leaves` | 255 | 511 | More capacity for expanded feature set + 3yr data |
+| `learning_rate` | 0.05 | 0.03 | Finer convergence with higher round cap |
+| `min_child_samples` | 200 | 50 | Less conservative — allows model to learn sparse/long-tail item patterns |
+| `num_boost_round` | 1000 | 2000 | 30d previously hit best_iter=905/999 — likely still improving |
+
+### Dataset Path Note
+
+Datasets are now local to the repo: `./dataset_large/TMPNXJ202603271.csv` and `./dataset_large/TMPNXJ202603272.csv`.
+
+### Run Command
+
+```bash
+conda run -n book_predict python -u train_lgbm.py \
+  --txn-path ./dataset_large/TMPNXJ202603271.csv \
+  --meta-path ./dataset_large/TMPNXJ202603272.csv \
+  --output-dir artifacts_lgbm_v2 \
+  --horizons 15 30 \
+  --min-history-days 10 \
+  --panel-days 1095 \
+  --max-train-rows 30000000 \
+  --device gpu \
+  --gpu-safe \
+  --n-jobs -1 \
+  --build-workers 16 \
+  --random-state 42
+```
+
+---
+
+## Addendum — 2026-04-06 (P1 Bug Fix: yoy_ratio saturation)
+
+### Bug
+
+`yoy_ratio` was computed as:
+```python
+panel["yoy_ratio"] = panel["roll_mean_28"] / (panel["roll_mean_28_yoy"].fillna(0) + 1e-6)
+```
+
+When `roll_mean_28_yoy` is NaN (item has < ~1 year of history), `fillna(0)` made the denominator `1e-6`, producing values ~10,000× inflated. After float16 quantization these saturated to the float16 max (~65504), corrupting training data for all new/young items.
+
+The comment said "zero when yoy is absent" — the code did the opposite.
+
+### Fix
+
+```python
+panel["yoy_ratio"] = np.where(
+    panel["roll_mean_28_yoy"].notna(),
+    panel["roll_mean_28"] / (panel["roll_mean_28_yoy"] + 1e-6),
+    0.0,
+)
+```
+
+Items with < 1 year of history now get `yoy_ratio=0` as intended.
+
+### Impact
+
+Comparison of `artifacts_lgbm_3yr` runs before vs after fix (same 3yr panel, same command):
+
+| Horizon | Split | Before fix | After fix | Delta |
+|---------|-------|-----------|-----------|-------|
+| 15d | valid | MAE=2.14, WAPE=0.6728 | MAE=2.11, WAPE=0.6650 | −0.03, −0.008 |
+| 15d | test  | MAE=2.10, WAPE=0.6608 | MAE=2.07, WAPE=0.6524 | −0.03, −0.008 |
+| 30d | valid | MAE=4.06, WAPE=0.6461 | MAE=3.92, WAPE=0.6241 | −0.14, −0.022 |
+| 30d | test  | MAE=3.88, WAPE=0.6196 | MAE=3.78, WAPE=0.6040 | −0.10, −0.016 |
+
+30d benefited more — it relies more heavily on the YoY signal over longer windows, and new items were polluting training with saturated values.
+
+### Remaining Known Issue (P2)
+
+Category rolling features (`category_roll_mean_28`, `category_yoy_ratio`) are computed on sale-event dates rather than calendar days. For sparse categories, zero-sale days drop out of the rolling window, making the "28-day" window span more than 28 calendar days. `item_share_of_category` also blows up on zero-sale merge dates. Fix requires reindexing `cat_daily` to a full dense date range per category — deferred to next iteration.

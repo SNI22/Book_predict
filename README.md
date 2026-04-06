@@ -7,7 +7,8 @@ Two trainers for book sales forecasting by `INVENTORY_ITEM_ID`.
 ### LightGBM (`train_lgbm.py`) — recommended
 - Predicts targets directly on `dataset_large` (~32.3M txns, 357K items, 7 years)
 - GPU-accelerated (RTX 5070)
-- Features: lags, rolling sums/means, YoY, revenue-derived, store count, calendar, categoricals
+- Features: lags (1/7/14/28/91/182/365d), rolling sums/means (7/14/28/91d), YoY ratio, velocity ratio, category-level rolling features, item share of category, store count, revenue-derived, calendar, categoricals (UN_NUMBER, BPDNAME, DLNAME, etc.)
+- Best results (3yr panel, 30M row cap): **15d WAPE=0.652, 30d WAPE=0.604** vs baselines 0.792 / 0.773
 
 ### HGBR (`train_sales_model.py`) — legacy
 - Rolling 28d mean + HistGradientBoostingRegressor residual blend on `dataset/` (~1.64M rows)
@@ -28,20 +29,27 @@ Two trainers for book sales forecasting by `INVENTORY_ITEM_ID`.
 ## Run
 
 ```bash
-# LightGBM — full run (357K items, 730 panel days, ~20min build)
-conda run -n book_predict python -u train_lgbm.py
-
-# LightGBM — with training row cap (required for 32GB RAM)
-conda run -n book_predict python -u train_lgbm.py --max-train-rows 30000000
-
-# LightGBM — GPU-safe mode (recommended on cluster GPUs)
+# LightGBM — recommended full run (3yr panel, GPU, 30M row cap)
 conda run -n book_predict python -u train_lgbm.py \
-  --device gpu --gpu-safe --n-jobs ${SLURM_CPUS_PER_TASK:-16} \
-  --max-train-rows 30000000 --output-dir artifacts_lgbm_30m_gpu_safe
+  --txn-path ./dataset_large/TMPNXJ202603271.csv \
+  --meta-path ./dataset_large/TMPNXJ202603272.csv \
+  --output-dir artifacts_lgbm_3yr \
+  --horizons 15 30 \
+  --min-history-days 10 \
+  --panel-days 1095 \
+  --max-train-rows 30000000 \
+  --device gpu --gpu-safe \
+  --n-jobs -1 --build-workers 16 \
+  --random-state 42
 
 # LightGBM — smoke test
 conda run -n book_predict python -u train_lgbm.py \
   --max-items 5000 --panel-days 400 --output-dir artifacts_lgbm_smoke
+
+# LightGBM — GPU-safe mode (cluster / SLURM)
+conda run -n book_predict python -u train_lgbm.py \
+  --device gpu --gpu-safe --n-jobs ${SLURM_CPUS_PER_TASK:-16} \
+  --max-train-rows 30000000 --output-dir artifacts_lgbm_30m_gpu_safe
 
 # HGBR — legacy
 conda run -n book_predict python train_sales_model.py
