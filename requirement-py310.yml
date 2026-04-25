@@ -1,0 +1,16 @@
+name: book_predict_py310
+channels:
+  - defaults
+dependencies:
+  - python=3.10
+  - numpy
+  - pandas
+  - scikit-learn
+  - scipy
+  - pyarrow
+  - joblib
+  - openpyxl
+  - tqdm
+  - pip
+  - pip:
+      - lightgbm==4.6.0
