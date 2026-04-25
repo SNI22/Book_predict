@@ -172,9 +172,6 @@ def load_and_aggregate_sales(config: LGBMTrainerConfig) -> pd.DataFrame:
         encoding="utf-8-sig",
         usecols=meta_usecols,
         dtype={"INVENTORY_ITEM_ID": "int64"},
-        usecols=["INVENTORY_ITEM_ID", "LIST_PRICE_PER_UNIT",
-                 "ITEM_CATEORY_CODE", "ITEM_CATEORY",
-                 "BPDNAME", "DLNUM", "DLNAME", "UN_NUMBER"],
     )
 
     # Fill metadata nulls
@@ -1294,9 +1291,18 @@ def run_training(config: LGBMTrainerConfig) -> list[dict[str, object]]:
             "test_baseline_wape": r["test_metrics"]["baseline_wape"],
         })
 
-    # Clean up temp parquet files
-    import shutil
-    shutil.rmtree(chunk_dir, ignore_errors=True)
+    # Clean up temp parquet files (set KEEP_CHUNKS=1 to retain for diagnostics)
+    if os.environ.get("KEEP_CHUNKS") == "1":
+        kept = config.output_dir / "chunks"
+        kept.mkdir(parents=True, exist_ok=True)
+        import shutil
+        for f in Path(chunk_dir).glob("*"):
+            shutil.copy2(f, kept / f.name)
+        print(f"KEEP_CHUNKS=1 → copied chunk parquet files to {kept}")
+        shutil.rmtree(chunk_dir, ignore_errors=True)
+    else:
+        import shutil
+        shutil.rmtree(chunk_dir, ignore_errors=True)
 
     config.output_dir.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(summary).to_csv(

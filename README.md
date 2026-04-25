@@ -153,3 +153,71 @@ YYYYMMDD_HHMMSS/
 |-----|-------|------|----------|----------|-------|
 | artifacts_lgbm_30m_gpu_safe | 2yr | 30M | 0.682 | 0.634 | baseline run |
 | artifacts_lgbm_3yr/20260406_002504 | 3yr | 30M | 0.652 | 0.604 | +feature expansion, yoy_ratio P1 fix, temporal sampling |
+
+---
+
+## Item Segmentation (Plan B — diagnostic)
+
+Tags every item with one of `regular / medium / sparse / seasonal / cold` based
+on the last 90 days of activity, plus a YoY autocorrelation / monthly-skew
+seasonality test on items with ≥ 365 days history. Lets us answer:
+
+- Which segment dominates the test population?
+- Where is WAPE actually bad — sparse tail, or seasonal items?
+- Should we add segment as a LightGBM feature for a model-level lift?
+
+### Files
+- `src/book_predict/segmentation.py` — `compute_item_segments`,
+  `enrich_panel_with_segments`, `per_segment_metrics`, `SegmentationConfig`.
+- `diagnose_segments.py` — CLI: scores existing model on parquet chunks and
+  reports per-segment MAE / WAPE.
+
+### Run
+
+The diagnostic needs the on-disk parquet chunks produced during training.
+Re-run training once with `KEEP_CHUNKS=1` so they're preserved into
+`<output-dir>/chunks/`:
+
+```bash
+# 1. Train and keep the chunk parquet files
+KEEP_CHUNKS=1 conda run -n book_predict python -u train_lgbm.py \
+    --device cuda --gpu-safe \
+    --max-train-rows 30000000 \
+    --output-dir artifacts_lgbm
+
+# 2. Run per-segment diagnostic for the 30d model
+conda run -n book_predict python -u diagnose_segments.py \
+    --chunks-dir artifacts_lgbm/chunks \
+    --model artifacts_lgbm/horizon_30d/model.lgb \
+    --horizon 30 \
+    --output artifacts_lgbm/segment_report_30d.csv
+
+# 3. Same for 15d
+conda run -n book_predict python -u diagnose_segments.py \
+    --chunks-dir artifacts_lgbm/chunks \
+    --model artifacts_lgbm/horizon_15d/model.lgb \
+    --horizon 15 \
+    --output artifacts_lgbm/segment_report_15d.csv
+```
+
+Outputs:
+- `artifacts_lgbm/item_segments.csv` — one row per item with segment label and stats.
+- `artifacts_lgbm/segment_report_<h>d.csv` — per-segment MAE / WAPE / n_rows.
+
+### Decision rules (`SegmentationConfig` defaults)
+
+| Segment | Rule |
+|---------|------|
+| `cold` | history < 90 days OR nonzero days in last 90 < 5 |
+| `seasonal` | history ≥ 365 days AND (corr(QTY_t, QTY_{t-365}) ≥ 0.30 OR max(monthly_QTY)/mean(monthly_QTY) ≥ 2.0) |
+| `regular` | nonzero days in last 90 ≥ 60 |
+| `medium` | 30 ≤ nonzero days in last 90 < 60 |
+| `sparse` | 5 ≤ nonzero days in last 90 < 30 |
+
+`seasonal` overrides the frequency tier; `cold` overrides everything.
+
+### Next step (only if diagnostic shows a clear lift opportunity)
+
+Wire `enrich_panel_with_segments(...)` into `_build_chunk_features` and add
+`SEGMENT_FEATURES` to `ALL_FEATURES` so a single LightGBM model can split on
+segment. Re-train and compare lift against the current baseline.

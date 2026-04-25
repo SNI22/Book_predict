@@ -592,3 +592,71 @@ conda run -n book_predict python -u train_lgbm.py --txn-path ./dataset_large/TMP
 | - | `is_weekend`, `lag_14`, `lag_28`, `primary_channel`, `DLNUM` near-zero feature importance | Low — cleanup |
 | - | `store_count_7`, `store_count_14` not yet added (#1 feature is `store_count_28`) | Medium |
 | - | `min_history_days=10` too low — items with <30 days have mostly NaN features | Medium |
+
+---
+
+## Session — 2026-04-25  Item Segmentation (Plan B diagnostic)
+
+### Context
+Reviewed `xsyc/` (a small per-item LightGBM script) versus the main `train_lgbm.py`
+pipeline. xsyc reports MAE ≈ 14.8 / WAPE ≈ 43.8% but with **R² ≈ −1.79** — i.e. it
+loses to the naive mean. Confirmed by writing `xsyc/baseline_compare.py`, which
+shows a 7-day rolling-mean baseline matches xsyc's LightGBM (MAE 14.85, WAPE 42.4%).
+Conclusion: xsyc's "good" numbers are an artefact of small per-SKU magnitudes plus
+a leak-prone in-series 80/20 split with early stopping on the test set.
+
+In contrast, the main pipeline reports test WAPE 64–68% on ~25M rows with a
+**−13.5 to −14.8 pp lift over baseline** — real learned signal.
+
+### User idea
+Group items by sales pattern (常销 / 中销 / 零散 / 季节) and predict differently per
+group. Recommended **Plan B**: keep the single LightGBM model and add segment
+labels as features, so the booster can specialize internally without losing
+cross-item learning. Data-driven seasonality detection (no manual labels).
+
+### Implemented
+- `src/book_predict/segmentation.py`
+  - `SegmentationConfig` (window 90d, regular ≥ 60 nonzero days, medium ≥ 30,
+    sparse ≥ 5, cold otherwise; seasonal via `corr(QTY_t, QTY_{t-365}) ≥ 0.30`
+    or `max(monthly)/mean(monthly) ≥ 2.0` with ≥ 365 days history).
+  - `compute_item_segments(panel)` — one row per item with segment label,
+    `nonzero_days_90`, `seasonality_score`, `yoy_strength`, `history_days`.
+  - `enrich_panel_with_segments(panel)` — int16-encoded segment + numeric stats
+    merged onto a featured panel; ready to add into `ALL_FEATURES`.
+  - `per_segment_metrics(y, ŷ, codes)` — MAE / WAPE per segment.
+- `diagnose_segments.py` — CLI; loads parquet chunks, scores the existing
+  trained model, reports per-segment MAE / WAPE. Saves `item_segments.csv`
+  and `segment_report_<h>d.csv`. Does NOT retrain.
+- `src/book_predict/trainer_lgbm.py`
+  - Added `KEEP_CHUNKS=1` env-var guard so training preserves the parquet
+    chunks under `<output-dir>/chunks/` for the diagnostic. Default behaviour
+    (delete chunks) unchanged.
+- `xsyc/baseline_compare.py` — dependency-free baselines (mean / last-value /
+  rolling-7-mean) on the xsyc test slice; saves `xsyc/baseline_对比结果.csv`.
+
+### CLI to run
+```bash
+# 1. Re-train with chunks preserved (one-time)
+KEEP_CHUNKS=1 conda run -n book_predict python -u train_lgbm.py \
+    --device cuda --gpu-safe --max-train-rows 30000000 \
+    --output-dir artifacts_lgbm
+
+# 2. Per-segment diagnostic
+conda run -n book_predict python -u diagnose_segments.py \
+    --chunks-dir artifacts_lgbm/chunks \
+    --model artifacts_lgbm/horizon_30d/model.lgb \
+    --horizon 30 \
+    --output artifacts_lgbm/segment_report_30d.csv
+```
+
+### Decision criterion for next step
+If `sparse + cold` segments dominate row count but produce most of the WAPE,
+or if `seasonal` items show a YoY signal the current model isn't using, then
+integrate `enrich_panel_with_segments` into `_build_chunk_features` and add
+`SEGMENT_FEATURES` to `ALL_FEATURES`. Otherwise, keep the diagnostic as-is and
+treat segments as a reporting lens.
+
+### Validation
+- `python3 -m py_compile src/book_predict/trainer_lgbm.py` — passes.
+- `python3 -m py_compile src/book_predict/segmentation.py diagnose_segments.py` — passes.
+- `xsyc/baseline_compare.py` ran end-to-end on the local 140K-row dataset.
