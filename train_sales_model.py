@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
-
-from src.book_predict.trainer import TrainerConfig, run_training
 
 
 def parse_args() -> argparse.Namespace:
@@ -51,11 +50,23 @@ def parse_args() -> argparse.Namespace:
         default=42,
         help="Random seed for deterministic training.",
     )
+    parser.add_argument(
+        "--n-jobs",
+        type=int,
+        default=-1,
+        help="OpenMP threads for HistGradientBoosting (-1 = all cores).",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    if args.n_jobs == -1:
+        os.environ["OMP_NUM_THREADS"] = str(os.cpu_count() or 1)
+    else:
+        os.environ["OMP_NUM_THREADS"] = str(args.n_jobs)
+    # Defer import until after env var is set so OpenMP picks it up.
+    from src.book_predict.trainer import TrainerConfig, run_training
     config = TrainerConfig(
         data_path=args.data_path,
         output_dir=args.output_dir,

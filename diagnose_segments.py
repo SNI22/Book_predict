@@ -49,6 +49,8 @@ def parse_args() -> argparse.Namespace:
                    default=Path("artifacts_lgbm/item_segments.csv"))
     p.add_argument("--max-rows-per-chunk", type=int, default=None,
                    help="Optional cap (debug only).")
+    p.add_argument("--n-jobs", type=int, default=-1,
+                   help="LightGBM prediction threads (-1 = all cores).")
     return p.parse_args()
 
 
@@ -99,6 +101,7 @@ def main() -> None:
 
     print("[3/4] Loading model and scoring test chunks ...")
     booster = lgb.Booster(model_file=str(args.model))
+    booster.params["num_threads"] = args.n_jobs
     feature_names = booster.feature_name()
 
     test_cutoff = _determine_test_cutoff(args.chunks_dir, args.test_start)
