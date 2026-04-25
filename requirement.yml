@@ -1,0 +1,16 @@
+name: book_predict
+channels:
+  - defaults
+dependencies:
+  - python=3.11
+  - numpy=2.4.3
+  - pandas=3.0.1
+  - scikit-learn=1.8.0
+  - scipy=1.17.1
+  - pyarrow=23.0.1
+  - joblib=1.5.3
+  - openpyxl=3.1.5
+  - tqdm
+  - pip
+  - pip:
+      - lightgbm==4.6.0
