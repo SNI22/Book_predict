@@ -43,7 +43,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--horizon", type=int, required=True, choices=[15, 30])
     p.add_argument("--test-start", type=str, default=None,
                    help="ISO date — only rows with XSRQ >= this are used as test. "
-                        "If omitted, uses the last 20% of dates.")
+                        "If omitted, uses the last 20%% of dates.")
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--segment-labels-out", type=Path,
                    default=Path("artifacts_lgbm/item_segments.csv"))
