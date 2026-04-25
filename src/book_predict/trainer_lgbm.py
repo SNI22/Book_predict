@@ -141,6 +141,7 @@ class LGBMTrainerConfig:
     build_workers: int = 1
     io_workers: int = 1                 # parallel chunk reads in Count/Stage phases
     gpu_device_id: int | None = None    # None = auto-assign (horizon 0→GPU0, horizon 1→GPU1, …)
+    build_only: bool = False            # Build chunks then exit (skip training).
 
 
 def _resolve_n_jobs(requested_n_jobs: int) -> int:
@@ -1286,6 +1287,17 @@ def run_training(config: LGBMTrainerConfig) -> list[dict[str, object]]:
     del sales
     gc.collect()
     print(f"Freed sales data [RSS: {_mem_gb()}]")
+
+    if config.build_only:
+        kept = config.output_dir / "chunks"
+        kept.mkdir(parents=True, exist_ok=True)
+        import shutil
+        for f in Path(chunk_dir).glob("*"):
+            shutil.copy2(f, kept / f.name)
+        shutil.rmtree(chunk_dir, ignore_errors=True)
+        joblib.dump(cat_mappings, config.output_dir / "cat_mappings.joblib")
+        print(f"build_only=True → chunks copied to {kept}; skipping training.")
+        return []
 
     use_multi_gpu = (
         config.device in {"gpu", "cuda"}

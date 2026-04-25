@@ -165,6 +165,11 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="Thread workers for parallel parquet reads in Count/Stage/Eval/Dates phases (1 = sequential).",
     )
+    parser.add_argument(
+        "--build-only",
+        action="store_true",
+        help="Build the panel chunks (under <output-dir>/chunks/) and exit without training.",
+    )
     return parser.parse_args()
 
 
@@ -194,6 +199,7 @@ def main() -> None:
         build_workers=args.build_workers,
         io_workers=args.io_workers,
         gpu_device_id=args.gpu_device_id,
+        build_only=args.build_only,
     )
     results = run_training(config)
     print("\n=== Summary ===")
