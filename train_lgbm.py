@@ -159,6 +159,12 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="Process workers for chunked pandas feature build (1 = sequential). Increase carefully due RAM usage.",
     )
+    parser.add_argument(
+        "--io-workers",
+        type=int,
+        default=1,
+        help="Thread workers for parallel parquet reads in Count/Stage/Eval/Dates phases (1 = sequential).",
+    )
     return parser.parse_args()
 
 
@@ -186,6 +192,7 @@ def main() -> None:
         max_cat_codes=args.max_cat_codes,
         gpu_safe=args.gpu_safe,
         build_workers=args.build_workers,
+        io_workers=args.io_workers,
         gpu_device_id=args.gpu_device_id,
     )
     results = run_training(config)

@@ -139,6 +139,7 @@ class LGBMTrainerConfig:
     max_cat_codes: int | None = None
     gpu_safe: bool = False
     build_workers: int = 1
+    io_workers: int = 1                 # parallel chunk reads in Count/Stage phases
     gpu_device_id: int | None = None    # None = auto-assign (horizon 0→GPU0, horizon 1→GPU1, …)
 
 
@@ -684,30 +685,68 @@ def _iter_filtered_chunks(
     *,
     include_ids: bool,
     desc: str,
+    io_workers: int = 1,
 ):
     target_col, required_cols = _required_cols_for_horizon(horizon)
     load_cols = _load_cols_for_horizon(horizon, include_ids=include_ids)
     chunk_files = sorted(chunk_dir.glob("chunk_*.parquet"))
 
-    total_kept = 0
-    for i, f in enumerate(
-        _iter_with_progress(chunk_files, total=len(chunk_files), desc=desc)
-    ):
+    def _read_one(f: Path) -> pd.DataFrame:
         chunk = pd.read_parquet(f, columns=load_cols)
-        chunk = chunk.dropna(subset=required_cols)
-        total_kept += len(chunk)
-        print(
-            f"  Read chunk {i + 1}/{len(chunk_files)}: "
-            f"kept {len(chunk):,} rows "
-            f"(cumulative: {total_kept:,}) [RSS: {_mem_gb()}]"
-        )
-        yield chunk
+        return chunk.dropna(subset=required_cols)
+
+    if io_workers <= 1 or len(chunk_files) <= 1:
+        total_kept = 0
+        for i, f in enumerate(
+            _iter_with_progress(chunk_files, total=len(chunk_files), desc=desc)
+        ):
+            chunk = _read_one(f)
+            total_kept += len(chunk)
+            print(
+                f"  Read chunk {i + 1}/{len(chunk_files)}: "
+                f"kept {len(chunk):,} rows "
+                f"(cumulative: {total_kept:,}) [RSS: {_mem_gb()}]"
+            )
+            yield chunk
+        return
+
+    # Parallel: prefetch up to `io_workers` chunks ahead while the consumer
+    # processes the current one. Yields in submission (file) order.
+    from collections import deque
+    from concurrent.futures import ThreadPoolExecutor
+
+    print(f"  [{desc}] reading chunks with {io_workers} parallel workers")
+    total_kept = 0
+    with ThreadPoolExecutor(max_workers=io_workers) as ex:
+        pending: deque = deque()
+        idx = 0
+        # Prime
+        while idx < len(chunk_files) and len(pending) < io_workers:
+            pending.append(ex.submit(_read_one, chunk_files[idx]))
+            idx += 1
+        yielded = 0
+        while pending:
+            chunk = pending.popleft().result()
+            total_kept += len(chunk)
+            yielded += 1
+            print(
+                f"  Read chunk {yielded}/{len(chunk_files)}: "
+                f"kept {len(chunk):,} rows "
+                f"(cumulative: {total_kept:,}) [RSS: {_mem_gb()}]"
+            )
+            yield chunk
+            if idx < len(chunk_files):
+                pending.append(ex.submit(_read_one, chunk_files[idx]))
+                idx += 1
 
 
-def _determine_split_dates(chunk_dir: Path, horizon: int) -> tuple[pd.Timestamp, pd.Timestamp]:
+def _determine_split_dates(
+    chunk_dir: Path, horizon: int, *, io_workers: int = 1,
+) -> tuple[pd.Timestamp, pd.Timestamp]:
     unique_dates: set[pd.Timestamp] = set()
     for chunk in _iter_filtered_chunks(
-        chunk_dir, horizon, include_ids=False, desc=f"Dates {horizon}d"
+        chunk_dir, horizon, include_ids=False, desc=f"Dates {horizon}d",
+        io_workers=io_workers,
     ):
         unique_dates.update(pd.to_datetime(chunk["XSRQ"].unique()).tolist())
 
@@ -730,12 +769,15 @@ def _count_split_rows(
     horizon: int,
     train_end: pd.Timestamp,
     valid_end: pd.Timestamp,
+    *,
+    io_workers: int = 1,
 ) -> tuple[int, int, int]:
     train_rows = 0
     valid_rows = 0
     test_rows = 0
     for chunk in _iter_filtered_chunks(
-        chunk_dir, horizon, include_ids=False, desc=f"Count {horizon}d"
+        chunk_dir, horizon, include_ids=False, desc=f"Count {horizon}d",
+        io_workers=io_workers,
     ):
         train_rows += int((chunk["XSRQ"] <= train_end).sum())
         valid_rows += int(((chunk["XSRQ"] > train_end) & (chunk["XSRQ"] <= valid_end)).sum())
@@ -758,6 +800,7 @@ def _write_train_valid_files(
     max_train_rows: int | None,
     recent_days: int,
     random_state: int,
+    io_workers: int = 1,
 ) -> tuple[Path, Path, int, int, int]:
     import gc
 
@@ -775,7 +818,8 @@ def _write_train_valid_files(
         recent_count = 0
         old_count = 0
         for chunk in _iter_filtered_chunks(
-            chunk_dir, horizon, include_ids=False, desc=f"Count {horizon}d"
+            chunk_dir, horizon, include_ids=False, desc=f"Count {horizon}d",
+            io_workers=io_workers,
         ):
             train_mask = chunk["XSRQ"] <= train_end
             recent_count += int((train_mask & (chunk["XSRQ"] > recent_cutoff)).sum())
@@ -809,7 +853,8 @@ def _write_train_valid_files(
     export_cols = [target_col] + ALL_FEATURES
 
     for chunk in _iter_filtered_chunks(
-        chunk_dir, horizon, include_ids=False, desc=f"Stage {horizon}d"
+        chunk_dir, horizon, include_ids=False, desc=f"Stage {horizon}d",
+        io_workers=io_workers,
     ):
         train_chunk = chunk[chunk["XSRQ"] <= train_end]
         if len(train_chunk) > 0 and (recent_keep_prob < 1.0 or old_keep_prob < 1.0):
@@ -981,6 +1026,8 @@ def _evaluate_streaming_splits(
     output_dir: Path,
     train_end: pd.Timestamp,
     valid_end: pd.Timestamp,
+    *,
+    io_workers: int = 1,
 ) -> tuple[dict[str, float], dict[str, float], int, int]:
     target_col, _ = _required_cols_for_horizon(horizon)
     valid_acc = _empty_metric_accumulator()
@@ -993,7 +1040,8 @@ def _evaluate_streaming_splits(
     wrote_predictions_header = False
 
     for chunk in _iter_filtered_chunks(
-        chunk_dir, horizon, include_ids=True, desc=f"Eval {horizon}d"
+        chunk_dir, horizon, include_ids=True, desc=f"Eval {horizon}d",
+        io_workers=io_workers,
     ):
         valid_chunk = chunk[(chunk["XSRQ"] > train_end) & (chunk["XSRQ"] <= valid_end)]
         test_chunk = chunk[chunk["XSRQ"] > valid_end]
@@ -1047,7 +1095,9 @@ def _stage_for_horizon(
     import tempfile
 
     print(f"\n--- Staging {horizon}d ---")
-    train_end, valid_end = _determine_split_dates(chunk_dir, horizon)
+    train_end, valid_end = _determine_split_dates(
+        chunk_dir, horizon, io_workers=config.io_workers,
+    )
     staging_dir = Path(tempfile.mkdtemp(prefix=f"book_predict_stage_{horizon}d_"))
     train_path, valid_path, train_rows, _, _ = _write_train_valid_files(
         chunk_dir,
@@ -1058,6 +1108,7 @@ def _stage_for_horizon(
         max_train_rows=config.max_train_rows,
         recent_days=config.recent_days,
         random_state=config.random_state,
+        io_workers=config.io_workers,
     )
     return staging_dir, train_path, valid_path, train_rows, train_end, valid_end
 
@@ -1083,7 +1134,9 @@ def train_for_horizon(
     if staged is not None:
         staging_dir, train_path, valid_path, train_rows, train_end, valid_end = staged
     else:
-        train_end, valid_end = _determine_split_dates(chunk_dir, horizon)
+        train_end, valid_end = _determine_split_dates(
+            chunk_dir, horizon, io_workers=config.io_workers,
+        )
         staging_dir = Path(tempfile.mkdtemp(prefix=f"book_predict_stage_{horizon}d_"))
         train_path, valid_path, train_rows, _, _ = _write_train_valid_files(
             chunk_dir,
@@ -1094,6 +1147,7 @@ def train_for_horizon(
             max_train_rows=config.max_train_rows,
             recent_days=config.recent_days,
             random_state=config.random_state,
+            io_workers=config.io_workers,
         )
 
     # Tell LightGBM which columns are categorical (they're int16-encoded)
@@ -1128,7 +1182,8 @@ def train_for_horizon(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     valid_metrics, test_metrics, valid_rows, test_rows = _evaluate_streaming_splits(
-        chunk_dir, horizon, booster, output_dir, train_end, valid_end
+        chunk_dir, horizon, booster, output_dir, train_end, valid_end,
+        io_workers=config.io_workers,
     )
 
     booster.save_model(str(output_dir / "model.lgb"))
