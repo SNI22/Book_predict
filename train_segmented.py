@@ -389,6 +389,12 @@ class _SilentLgbLogger:
 
 def main() -> None:
     args = parse_args()
+    suffix = f"{args.horizon}d"
+    if suffix not in args.output_dir.name:
+        args.output_dir = args.output_dir.with_name(
+            f"{args.output_dir.name}_horizon_{suffix}"
+        )
+        print(f"[auto] output dir → {args.output_dir}")
     args.output_dir.mkdir(parents=True, exist_ok=True)
     lgb.register_logger(_SilentLgbLogger())
 
