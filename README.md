@@ -18,10 +18,10 @@ Two trainers for book sales forecasting by `INVENTORY_ITEM_ID`.
 
 ```bash
 # Full run — CUDA, 3yr panel, multi-GPU (recommended)
-conda run -n book_predict python -u train_lgbm.py --txn-path ./dataset_large/TMPNXJ202603271.csv --meta-path ./dataset_large/TMPNXJ202603272.csv --output-dir artifacts_lgbm_3yr_cuda --horizons 15 30 --min-history-days 10 --panel-days 1095 --max-train-rows 30000000 --device cuda --gpu-safe --n-jobs -1 --build-workers 16 --random-state 42
+python -u train_lgbm.py --txn-path ./dataset_large/TMPNXJ202603271.csv --meta-path ./dataset_large/TMPNXJ202603272.csv --output-dir artifacts_lgbm_3yr_cuda --horizons 15 30 --min-history-days 10 --panel-days 1095 --max-train-rows 30000000 --device cuda --gpu-safe --n-jobs -1 --build-workers 16 --random-state 42
 
 # Smoke test (fast, ~2 min)
-conda run -n book_predict python -u train_lgbm.py --txn-path ./dataset_large/TMPNXJ202603271.csv --meta-path ./dataset_large/TMPNXJ202603272.csv --output-dir artifacts_lgbm_smoke --max-items 2000 --panel-days 400 --device cuda --gpu-safe --n-jobs -1
+python -u train_lgbm.py --txn-path ./dataset_large/TMPNXJ202603271.csv --meta-path ./dataset_large/TMPNXJ202603272.csv --output-dir artifacts_lgbm_smoke --max-items 2000 --panel-days 400 --device cuda --gpu-safe --n-jobs -1
 ```
 
 Each run creates a timestamped subfolder: `<output-dir>/YYYYMMDD_HHMMSS/`
@@ -180,20 +180,20 @@ Re-run training once with `KEEP_CHUNKS=1` so they're preserved into
 
 ```bash
 # 1. Train and keep the chunk parquet files
-KEEP_CHUNKS=1 conda run -n book_predict python -u train_lgbm.py \
+KEEP_CHUNKS=1 python -u train_lgbm.py \
     --device cuda --gpu-safe \
     --max-train-rows 30000000 \
     --output-dir artifacts_lgbm
 
 # 2. Run per-segment diagnostic for the 30d model
-conda run -n book_predict python -u diagnose_segments.py \
+python -u diagnose_segments.py \
     --chunks-dir artifacts_lgbm/chunks \
     --model artifacts_lgbm/horizon_30d/model.lgb \
     --horizon 30 \
     --output artifacts_lgbm/segment_report_30d.csv
 
 # 3. Same for 15d
-conda run -n book_predict python -u diagnose_segments.py \
+python -u diagnose_segments.py \
     --chunks-dir artifacts_lgbm/chunks \
     --model artifacts_lgbm/horizon_15d/model.lgb \
     --horizon 15 \
@@ -233,7 +233,7 @@ together for inference.
 
 ```bash
 # Reuses an existing chunks dir (from --build-only or KEEP_CHUNKS=1)
-conda run -n book_predict python -u train_segmented.py \
+python -u train_segmented.py \
     --chunks-dir artifacts_lgbm/<run>/chunks \
     --horizon 30 \
     --output-dir artifacts_lgbm_segmented/horizon_30d \
@@ -252,7 +252,7 @@ Skip training and only persist the panel chunks. Useful when iterating on
 feature engineering or training on a different machine.
 
 ```bash
-conda run -n book_predict python -u train_lgbm.py \
+python -u train_lgbm.py \
     --device gpu --gpu-safe \
     --output-dir artifacts_lgbm/run_x \
     --build-only
@@ -277,13 +277,13 @@ Non-destructive post-processor: reads existing parquet chunks from
 Mainland China holidays hardcoded for 2022–2027.
 
 ```bash
-conda run -n book_predict python -u enrich_panel.py \
+python -u enrich_panel.py \
     --in-dir  artifacts_lgbm/run_x/<ts>/chunks \
     --out-dir artifacts_lgbm_enriched/horizon_30d/chunks \
     --io-workers 4
 
 # Then train against the enriched chunks
-conda run -n book_predict python -u train_segmented.py \
+python -u train_segmented.py \
     --chunks-dir artifacts_lgbm_enriched/horizon_30d/chunks \
     --horizon 30 \
     --output-dir artifacts_lgbm_segmented_v2/horizon_30d

@@ -274,13 +274,13 @@ Target: fit 141M rows in <28GB so training has headroom for LightGBM internal co
 
 ```bash
 # Full run (target: fits 32GB with int16 cats + column pruning)
-cd ~/Documents/book_predict_lgbm && conda run -n book_predict python -u train_lgbm.py --output-dir artifacts_lgbm
+cd ~/Documents/book_predict_lgbm && python -u train_lgbm.py --output-dir artifacts_lgbm
 
 # Full run with row cap (safe fallback if OOM, loses time density)
-cd ~/Documents/book_predict_lgbm && conda run -n book_predict python -u train_lgbm.py --max-train-rows 30000000 --output-dir artifacts_lgbm
+cd ~/Documents/book_predict_lgbm && python -u train_lgbm.py --max-train-rows 30000000 --output-dir artifacts_lgbm
 
 # Smoke test
-cd ~/Documents/book_predict_lgbm && conda run -n book_predict python -u train_lgbm.py \
+cd ~/Documents/book_predict_lgbm && python -u train_lgbm.py \
   --max-items 5000 --panel-days 400 --output-dir artifacts_lgbm_smoke
 ```
 
@@ -376,7 +376,7 @@ Pick the lowest value that keeps WAPE stable for your horizons.
 ### 6. Recommended Cluster Command
 
 ```bash
-cd ~/Documents/book_predict_lgbm && conda run -n book_predict python -u train_lgbm.py \
+cd ~/Documents/book_predict_lgbm && python -u train_lgbm.py \
   --device gpu \
   --gpu-safe \
   --n-jobs ${SLURM_CPUS_PER_TASK:-16} \
@@ -459,7 +459,7 @@ Datasets are now local to the repo: `./dataset_large/TMPNXJ202603271.csv` and `.
 ### Run Command
 
 ```bash
-conda run -n book_predict python -u train_lgbm.py \
+python -u train_lgbm.py \
   --txn-path ./dataset_large/TMPNXJ202603271.csv \
   --meta-path ./dataset_large/TMPNXJ202603272.csv \
   --output-dir artifacts_lgbm_v2 \
@@ -581,7 +581,7 @@ artifacts_lgbm_3yr_cuda/
 ### Current Best Run Command (CUDA, 3yr panel)
 
 ```bash
-conda run -n book_predict python -u train_lgbm.py --txn-path ./dataset_large/TMPNXJ202603271.csv --meta-path ./dataset_large/TMPNXJ202603272.csv --output-dir artifacts_lgbm_3yr_cuda --horizons 15 30 --min-history-days 10 --panel-days 1095 --max-train-rows 30000000 --device cuda --gpu-safe --n-jobs -1 --build-workers 16 --random-state 42
+python -u train_lgbm.py --txn-path ./dataset_large/TMPNXJ202603271.csv --meta-path ./dataset_large/TMPNXJ202603272.csv --output-dir artifacts_lgbm_3yr_cuda --horizons 15 30 --min-history-days 10 --panel-days 1095 --max-train-rows 30000000 --device cuda --gpu-safe --n-jobs -1 --build-workers 16 --random-state 42
 ```
 
 ### Known Remaining Issues (Next Iteration)
@@ -637,12 +637,12 @@ cross-item learning. Data-driven seasonality detection (no manual labels).
 ### CLI to run
 ```bash
 # 1. Re-train with chunks preserved (one-time)
-KEEP_CHUNKS=1 conda run -n book_predict python -u train_lgbm.py \
+KEEP_CHUNKS=1 python -u train_lgbm.py \
     --device cuda --gpu-safe --max-train-rows 30000000 \
     --output-dir artifacts_lgbm
 
 # 2. Per-segment diagnostic
-conda run -n book_predict python -u diagnose_segments.py \
+python -u diagnose_segments.py \
     --chunks-dir artifacts_lgbm/chunks \
     --model artifacts_lgbm/horizon_30d/model.lgb \
     --horizon 30 \
@@ -692,17 +692,17 @@ Phase 2 (stockout-corrected rolling means) deferred — would require recomputin
 ### Workflow
 ```bash
 # 1. Build once (server preferred)
-conda run -n book_predict python -u train_lgbm.py \
+python -u train_lgbm.py \
     --device gpu --gpu-safe --output-dir artifacts_lgbm/run_x --build-only
 
 # 2. Enrich (chunk-by-chunk, low RAM)
-conda run -n book_predict python -u enrich_panel.py \
+python -u enrich_panel.py \
     --in-dir  artifacts_lgbm/run_x/<ts>/chunks \
     --out-dir artifacts_lgbm_enriched/horizon_30d/chunks \
     --io-workers 4
 
 # 3. Train segmented
-conda run -n book_predict python -u train_segmented.py \
+python -u train_segmented.py \
     --chunks-dir artifacts_lgbm_enriched/horizon_30d/chunks \
     --horizon 30 --output-dir artifacts_lgbm_segmented_v2/horizon_30d \
     --device gpu --gpu-safe --io-workers 4

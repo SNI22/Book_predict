@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Environment
 
-Conda environment: `book_predict`. Always prefix Python commands with `conda run -n book_predict`.
+Conda environment: `book_predict`. The user activates it manually (`conda activate book_predict`); invoke scripts as plain `python -u ...` — do not prefix with `conda run`.
 
 Key packages: LightGBM 4.6 (CUDA build via conda-forge), pandas, numpy, pyarrow, joblib, tqdm.
 
@@ -24,26 +24,26 @@ Dataset paths default to `../book_predict/dataset_large/`. Override with `--txn-
 
 ```bash
 # A. Standard training (single global model per horizon)
-conda run -n book_predict python -u train_lgbm.py \
+python -u train_lgbm.py \
     --device cuda --gpu-safe --max-train-rows 30000000 \
     --output-dir artifacts_lgbm
 
 # B. Build-once, iterate on features and segmented training
 # 1) Build chunks only (skip training)
-conda run -n book_predict python -u train_lgbm.py \
+python -u train_lgbm.py \
     --device gpu --gpu-safe --output-dir artifacts_lgbm/run_x --build-only
 # 2) (optional) Enrich chunks with new features
-conda run -n book_predict python -u enrich_panel.py \
+python -u enrich_panel.py \
     --in-dir  artifacts_lgbm/run_x/<ts>/chunks \
     --out-dir artifacts_lgbm_enriched/horizon_30d/chunks --io-workers 4
 # 3) Train segmented against original or enriched chunks
-conda run -n book_predict python -u train_segmented.py \
+python -u train_segmented.py \
     --chunks-dir artifacts_lgbm_enriched/horizon_30d/chunks \
     --horizon 30 --output-dir artifacts_lgbm_segmented/horizon_30d \
     --device gpu --gpu-safe --io-workers 4
 
 # C. Smoke test (fast, ~2 min)
-conda run -n book_predict python -u train_lgbm.py \
+python -u train_lgbm.py \
     --max-items 5000 --panel-days 400 --output-dir artifacts_lgbm_smoke
 ```
 
