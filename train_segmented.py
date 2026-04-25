@@ -24,6 +24,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -44,7 +46,7 @@ from src.book_predict.segmentation import (
 BASE_PARAMS = {
     "objective": "regression_l1",
     "metric": "mae",
-    "learning_rate": 0.05,
+    "learning_rate": 0.03,
     "num_leaves": 255,
     "min_child_samples": 200,
     "feature_fraction": 0.8,
@@ -55,19 +57,57 @@ BASE_PARAMS = {
     "verbose": -1,
 }
 
+# Per-segment overrides. Tuned from observed best_iter on the prior run:
+#   regular  best_iter ~50   (tiny n; keep higher LR, short cap)
+#   medium   best_iter ~190-260 at lr=0.05 -> deeper trees + lower LR
+#   seasonal best_iter ~545+ at lr=0.05 (hit cap) -> deeper + lower LR + bigger cap
+#   sparse   tweedie, was ~100-140 -> lower LR for finer fit
+#   cold     tweedie, heavily regularized; lr=0.03 with bigger cap
 SEGMENT_PARAMS: dict[str, dict] = {
-    "regular":  {},                                       # base
-    "medium":   {},                                       # base
+    "regular":  {"learning_rate": 0.05, "num_leaves": 127, "min_child_samples": 50},
+    "medium":   {"num_leaves": 511, "min_child_samples": 100},
     "seasonal": {"num_leaves": 511, "min_child_samples": 100},
-    "sparse":   {"objective": "tweedie", "tweedie_variance_power": 1.3, "metric": "rmse"},
+    "sparse":   {"objective": "tweedie", "tweedie_variance_power": 1.3,
+                 "metric": "rmse"},
     "cold":     {"objective": "tweedie", "tweedie_variance_power": 1.5,
-                 "metric": "rmse", "num_leaves": 63, "min_child_samples": 50},
+                 "metric": "rmse", "num_leaves": 63, "min_child_samples": 50,
+                 "lambda_l2": 5.0},
 }
 
+# Generous caps so early_stopping decides; lower LR needs more rounds.
 SEGMENT_NUM_BOOST = {
-    "regular": 1000, "medium": 1000, "seasonal": 1500,
-    "sparse": 800, "cold": 400,
+    "regular": 800, "medium": 4000, "seasonal": 6000,
+    "sparse": 3000, "cold": 2000,
 }
+
+
+# ---------------------------------------------------------------------------
+# Thread-safe logging with a segment prefix so parallel boosters don't
+# interleave unreadably.
+# ---------------------------------------------------------------------------
+_LOG_LOCK = threading.Lock()
+
+
+def _log(tag: str, msg: str) -> None:
+    line = f"[{tag:>8}] {msg}"
+    with _LOG_LOCK:
+        sys.stdout.write(line + "\n")
+        sys.stdout.flush()
+
+
+def _segment_log_callback(segment: str, period: int = 50):
+    """LightGBM callback that prints valid metrics with a segment prefix."""
+    def _cb(env):
+        it = env.iteration + 1
+        if it % period != 0 and it != env.end_iteration:
+            return
+        parts = [f"iter={it:>4}"]
+        for _, name, value, _ in env.evaluation_result_list:
+            parts.append(f"{name}={value:.4f}")
+        _log(segment, "  ".join(parts))
+    _cb.order = 10
+    _cb.before_iteration = False
+    return _cb
 
 
 def parse_args() -> argparse.Namespace:
@@ -78,7 +118,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--device", default="cpu", choices=["cpu", "gpu"])
     p.add_argument("--gpu-safe", action="store_true",
                    help="Cap max_bin/cat thresholds for GPU stability.")
-    p.add_argument("--early-stopping", type=int, default=50)
+    p.add_argument("--early-stopping", type=int, default=100)
     p.add_argument("--valid-frac", type=float, default=0.15)
     p.add_argument("--test-frac", type=float, default=0.15)
     p.add_argument("--max-rows-per-segment", type=int, default=None,
@@ -180,8 +220,9 @@ def _load_segment_panel(
         if not df_train.empty: train_parts.append(df_train)
         if not df_valid.empty: valid_parts.append(df_valid)
         if not df_test.empty:  test_parts.append(df_test)
-        print(f"      [{SEGMENT_LABELS[target_seg]}] chunk {i}/{len(files)}  "
-              f"train+={len(df_train):,} valid+={len(df_valid):,} test+={len(df_test):,}")
+        _log(SEGMENT_LABELS[target_seg],
+             f"chunk {i:>3}/{len(files)}  "
+             f"train+={len(df_train):>9,}  valid+={len(df_valid):>9,}  test+={len(df_test):>9,}")
 
     train = pd.concat(train_parts, ignore_index=True) if train_parts else pd.DataFrame()
     valid = pd.concat(valid_parts, ignore_index=True) if valid_parts else pd.DataFrame()
@@ -269,13 +310,14 @@ def _train_one_segment(
     train, valid, test = splits["train"], splits["valid"], splits["test"]
 
     if train.empty or valid.empty:
-        print(f"  [{segment}] skip — train={len(train):,} valid={len(valid):,}")
+        _log(segment, f"skip — train={len(train):,}  valid={len(valid):,}")
         return {"segment": segment, "skipped": True,
                 "n_train": len(train), "n_valid": len(valid), "n_test": len(test)}
 
     params = _build_params(args, segment)
-    print(f"  [{segment}] train rows: {len(train):,}  valid: {len(valid):,}  "
-          f"test: {len(test):,}  objective={params['objective']}")
+    _log(segment,
+         f"start  train={len(train):>9,}  valid={len(valid):>9,}  "
+         f"test={len(test):>9,}  objective={params['objective']}")
 
     cat_idx = [feature_cols.index(c) for c in cat_cols if c in feature_cols]
     dtrain = lgb.Dataset(
@@ -295,11 +337,12 @@ def _train_one_segment(
         valid_sets=[dvalid],
         callbacks=[
             lgb.early_stopping(args.early_stopping, verbose=False),
-            lgb.log_evaluation(period=50),
+            _segment_log_callback(segment, period=50),
         ],
     )
     elapsed = time.time() - t0
     booster.save_model(str(out_dir / f"model_{segment}.lgb"))
+    _log(segment, f"done   best_iter={booster.best_iteration}  elapsed={elapsed:6.1f}s")
 
     # Test metrics for this segment
     if test.empty:
@@ -332,9 +375,22 @@ def _train_one_segment(
 # Main
 # ---------------------------------------------------------------------------
 
+class _SilentLgbLogger:
+    """Drop LightGBM's repeated 'negative value in categorical features' spam."""
+    def info(self, msg: str) -> None:
+        if "negative value in categorical features" in msg:
+            return
+        sys.stdout.write(msg + "\n")
+    def warning(self, msg: str) -> None:
+        if "negative value in categorical features" in msg:
+            return
+        sys.stdout.write("WARN " + msg + "\n")
+
+
 def main() -> None:
     args = parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    lgb.register_logger(_SilentLgbLogger())
 
     print(f"[1/5] Discovering panel features under {args.chunks_dir} ...")
     sample_chunk = next(iter(sorted(args.chunks_dir.glob("*.parquet"))))
@@ -371,7 +427,7 @@ def main() -> None:
     active_segments = [(c, l) for c, l in enumerate(SEGMENT_LABELS) if pop[l] > 0]
 
     def _run(code: int, label: str) -> dict:
-        print(f"\n--- segment: {label} ---")
+        _log(label, "launch")
         splits = _load_segment_panel(
             args.chunks_dir, args.horizon, item_to_seg, code,
             feature_cols, test_cutoff, valid_cutoff,
