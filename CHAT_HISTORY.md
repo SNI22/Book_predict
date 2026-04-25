@@ -660,3 +660,55 @@ treat segments as a reporting lens.
 - `python3 -m py_compile src/book_predict/trainer_lgbm.py` — passes.
 - `python3 -m py_compile src/book_predict/segmentation.py diagnose_segments.py` — passes.
 - `xsyc/baseline_compare.py` ran end-to-end on the local 140K-row dataset.
+
+---
+
+## 2026-04-25 — Segmented training, hyperparameter tuning, panel enrichment
+
+### Per-segment hyperparameter tuning (`train_segmented.py`)
+Initial segmented run (15d): OVERALL WAPE **0.6121** (vs 0.6733 unsegmented — a ~9% relative improvement). 30d run gave per-segment WAPE: regular 0.530, medium 0.429, sparse 0.510, cold 1.597, seasonal 0.637 — `cold` is the dominant drag.
+
+Tuned per-segment params based on observed `best_iter` from the prior run:
+- **Base LR** 0.05 → 0.03; default `--early-stopping` 50 → 100.
+- **regular**: kept `lr=0.05`, `num_leaves=127`, `min_child_samples=50` (tiny n).
+- **medium**: `num_leaves=511`, `min_child_samples=100` (1.6M rows can support deeper trees).
+- **seasonal**: `num_leaves=511` (already), `num_boost_round` cap raised to 6000 (was hitting 545).
+- **cold**: kept `tweedie 1.5`, added `lambda_l2=5.0`.
+- `num_boost_round` caps raised across the board so early stopping decides.
+
+### `--build-only` flag
+Added `LGBMTrainerConfig.build_only` and `train_lgbm.py --build-only`. After `build_featured_panel` runs, chunks are copied to `<output-dir>/chunks/`, `cat_mappings.joblib` is saved, and the trainer exits — skipping the (expensive) per-horizon staging + training. Lets us iterate on feature engineering without re-running the load/aggregate phase.
+
+### `enrich_panel.py` (Phase-1 feature engineering)
+Non-destructive post-processor: reads chunks from `--in-dir`, writes augmented chunks to `--out-dir`. Added columns:
+- `holiday_type` int16 (mainland China holidays 2022-2027 hardcoded), `days_to_holiday`, `days_since_holiday`
+- `discount_ratio_28` = `avg_revenue_per_unit_28 / LIST_PRICE_PER_UNIT` (proxy for active discount)
+- `store_demand_lag1_mean` — cross-item demand: mean of `lag_1` across items sharing the same `primary_store` on the same date
+
+The segmented trainer auto-discovers new columns via `_discover_features` (int16 small-range → categorical, others → numeric), so no trainer changes were needed.
+
+Phase 2 (stockout-corrected rolling means) deferred — would require recomputing existing lag/roll features.
+
+### Workflow
+```bash
+# 1. Build once (server preferred)
+conda run -n book_predict python -u train_lgbm.py \
+    --device gpu --gpu-safe --output-dir artifacts_lgbm/run_x --build-only
+
+# 2. Enrich (chunk-by-chunk, low RAM)
+conda run -n book_predict python -u enrich_panel.py \
+    --in-dir  artifacts_lgbm/run_x/<ts>/chunks \
+    --out-dir artifacts_lgbm_enriched/horizon_30d/chunks \
+    --io-workers 4
+
+# 3. Train segmented
+conda run -n book_predict python -u train_segmented.py \
+    --chunks-dir artifacts_lgbm_enriched/horizon_30d/chunks \
+    --horizon 30 --output-dir artifacts_lgbm_segmented_v2/horizon_30d \
+    --device gpu --gpu-safe --io-workers 4
+```
+
+### Open questions
+- Will lower base LR + bigger caps actually help, or just train longer for the same WAPE? Need fresh run to confirm.
+- Does `holiday_type` add real lift on 30d horizon (15d window may straddle the holiday already)?
+- Cold WAPE 1.6 — even tweedie + heavier reg may not help. Likely needs a two-stage P(sale>0) × E[sale|sale>0] model; that's the next big lever.

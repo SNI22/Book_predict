@@ -221,3 +221,73 @@ Outputs:
 Wire `enrich_panel_with_segments(...)` into `_build_chunk_features` and add
 `SEGMENT_FEATURES` to `ALL_FEATURES` so a single LightGBM model can split on
 segment. Re-train and compare lift against the current baseline.
+
+---
+
+## Segmented Trainer (`train_segmented.py`) — Plan B
+
+Trains one LightGBM booster per segment (regular / medium / seasonal / sparse /
+cold) with per-segment objectives + hyperparameters. Sparse + cold use
+`tweedie` (zero-inflated). Routing meta + per-segment models are saved
+together for inference.
+
+```bash
+# Reuses an existing chunks dir (from --build-only or KEEP_CHUNKS=1)
+conda run -n book_predict python -u train_segmented.py \
+    --chunks-dir artifacts_lgbm/<run>/chunks \
+    --horizon 30 \
+    --output-dir artifacts_lgbm_segmented/horizon_30d \
+    --device gpu --gpu-safe --io-workers 4
+```
+
+Per-segment params live at the top of `train_segmented.py`. Current run
+(30d) yields **OVERALL WAPE ~0.60**, with `cold` (WAPE ~1.6) the dominant
+remaining drag.
+
+---
+
+## Build-only mode
+
+Skip training and only persist the panel chunks. Useful when iterating on
+feature engineering or training on a different machine.
+
+```bash
+conda run -n book_predict python -u train_lgbm.py \
+    --device gpu --gpu-safe \
+    --output-dir artifacts_lgbm/run_x \
+    --build-only
+# → chunks land under artifacts_lgbm/run_x/<ts>/chunks/
+```
+
+---
+
+## Panel Enrichment (`enrich_panel.py`)
+
+Non-destructive post-processor: reads existing parquet chunks from
+`--in-dir` and writes augmented chunks to `--out-dir`. Adds:
+
+| Column | Type | Meaning |
+|--------|------|---------|
+| `holiday_type` | int16 | 0=none, 1=spring, 2=qingming, 3=labor, 4=dragon, 5=mid-autumn, 6=national, 7=new-year |
+| `days_to_holiday` | float16 | Days until next holiday, capped at 30 |
+| `days_since_holiday` | float16 | Days since last holiday, capped at 30 |
+| `discount_ratio_28` | float16 | `avg_revenue_per_unit_28 / LIST_PRICE_PER_UNIT`, clipped to [0, 2] |
+| `store_demand_lag1_mean` | float32 | Mean `lag_1` across items sharing the same `primary_store` on the same date |
+
+Mainland China holidays hardcoded for 2022–2027.
+
+```bash
+conda run -n book_predict python -u enrich_panel.py \
+    --in-dir  artifacts_lgbm/run_x/<ts>/chunks \
+    --out-dir artifacts_lgbm_enriched/horizon_30d/chunks \
+    --io-workers 4
+
+# Then train against the enriched chunks
+conda run -n book_predict python -u train_segmented.py \
+    --chunks-dir artifacts_lgbm_enriched/horizon_30d/chunks \
+    --horizon 30 \
+    --output-dir artifacts_lgbm_segmented_v2/horizon_30d
+```
+
+Skip the cross-item store aggregation with `--skip-store-demand` if RAM is
+tight. Phase 2 (stockout-corrected rolling means) is not yet implemented.
