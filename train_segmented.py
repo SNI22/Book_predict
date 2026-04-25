@@ -89,6 +89,9 @@ def parse_args() -> argparse.Namespace:
                    help="Train this many segments concurrently (server use). "
                         "Each concurrent booster uses --n-jobs threads, so set "
                         "n_jobs * parallel_segments <= total cores.")
+    p.add_argument("--io-workers", type=int, default=1,
+                   help="Thread workers for parallel parquet reads when "
+                        "scanning chunk files (1 = sequential).")
     p.add_argument("--feature-list", type=Path, default=None,
                    help="Optional JSON with a pre-saved feature list. "
                         "Defaults to all numeric+categorical cols in chunks "
@@ -126,6 +129,7 @@ def _load_segment_panel(
     test_cutoff: pd.Timestamp,
     valid_cutoff: pd.Timestamp,
     max_rows: int | None,
+    io_workers: int = 1,
 ) -> dict[str, pd.DataFrame]:
     """Stream every parquet chunk, pulling rows whose item belongs to the target
     segment, and split into train/valid/test by date."""
@@ -136,8 +140,31 @@ def _load_segment_panel(
     train_parts, valid_parts, test_parts = [], [], []
 
     files = sorted(chunks_dir.glob("*.parquet"))
-    for i, f in enumerate(files, 1):
-        df = pd.read_parquet(f, columns=needed)
+
+    def _read(f: Path) -> pd.DataFrame:
+        return pd.read_parquet(f, columns=needed)
+
+    if io_workers > 1 and len(files) > 1:
+        from collections import deque
+        from concurrent.futures import ThreadPoolExecutor
+        ex = ThreadPoolExecutor(max_workers=io_workers)
+        pending: deque = deque()
+        idx = 0
+        while idx < len(files) and len(pending) < io_workers:
+            pending.append(ex.submit(_read, files[idx])); idx += 1
+        chunks_iter = iter(())
+        def gen():
+            nonlocal idx
+            while pending:
+                yield pending.popleft().result()
+                if idx < len(files):
+                    pending.append(ex.submit(_read, files[idx])); idx += 1
+            ex.shutdown(wait=True)
+        chunks_iter = gen()
+    else:
+        chunks_iter = (_read(f) for f in files)
+
+    for i, df in enumerate(chunks_iter, 1):
         seg_codes = df["INVENTORY_ITEM_ID"].map(item_to_seg).fillna(
             SEGMENT_LABELS.index("cold")
         ).astype("int16").to_numpy()
@@ -170,12 +197,20 @@ def _load_segment_panel(
 # Date splits
 # ---------------------------------------------------------------------------
 
-def _compute_date_cutoffs(chunks_dir: Path, valid_frac: float, test_frac: float
+def _compute_date_cutoffs(chunks_dir: Path, valid_frac: float, test_frac: float,
+                          io_workers: int = 1
                           ) -> tuple[pd.Timestamp, pd.Timestamp]:
     files = sorted(chunks_dir.glob("*.parquet"))
+    def _read_dates(f: Path) -> pd.DataFrame:
+        return pd.read_parquet(f, columns=["XSRQ"])
+    if io_workers > 1 and len(files) > 1:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=io_workers) as ex:
+            dfs = list(ex.map(_read_dates, files))
+    else:
+        dfs = [_read_dates(f) for f in files]
     lo, hi = None, None
-    for f in files:
-        d = pd.read_parquet(f, columns=["XSRQ"])
+    for d in dfs:
         if d.empty:
             continue
         a, b = d["XSRQ"].min(), d["XSRQ"].max()
@@ -193,11 +228,16 @@ def _compute_date_cutoffs(chunks_dir: Path, valid_frac: float, test_frac: float
 # Segmentation
 # ---------------------------------------------------------------------------
 
-def _build_segments(chunks_dir: Path) -> pd.DataFrame:
+def _build_segments(chunks_dir: Path, io_workers: int = 1) -> pd.DataFrame:
     """Read minimal cols (ITEM_ID, XSRQ, lag_1) from every chunk and label items."""
     files = sorted(chunks_dir.glob("*.parquet"))
     cols = ["INVENTORY_ITEM_ID", "XSRQ", "lag_1"]
-    parts = [pd.read_parquet(f, columns=cols) for f in files]
+    if io_workers > 1 and len(files) > 1:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=io_workers) as ex:
+            parts = list(ex.map(lambda f: pd.read_parquet(f, columns=cols), files))
+    else:
+        parts = [pd.read_parquet(f, columns=cols) for f in files]
     panel = pd.concat(parts, ignore_index=True)
     return compute_item_segments(panel, config=SegmentationConfig())
 
@@ -307,7 +347,7 @@ def main() -> None:
     print(f"      {len(feature_cols)} features ({len(cat_cols)} categorical)")
 
     print("[2/5] Computing item segments ...")
-    segs = _build_segments(args.chunks_dir)
+    segs = _build_segments(args.chunks_dir, io_workers=args.io_workers)
     segs.to_csv(args.output_dir / "item_segments.csv",
                 index=False, encoding="utf-8-sig")
     pop = segs["item_segment"].value_counts().reindex(SEGMENT_LABELS, fill_value=0)
@@ -320,7 +360,8 @@ def main() -> None:
 
     print("[3/5] Computing date cutoffs ...")
     valid_cutoff, test_cutoff = _compute_date_cutoffs(
-        args.chunks_dir, args.valid_frac, args.test_frac
+        args.chunks_dir, args.valid_frac, args.test_frac,
+        io_workers=args.io_workers,
     )
     print(f"      valid >= {valid_cutoff.date()}, test >= {test_cutoff.date()}")
 
@@ -335,6 +376,7 @@ def main() -> None:
             args.chunks_dir, args.horizon, item_to_seg, code,
             feature_cols, test_cutoff, valid_cutoff,
             args.max_rows_per_segment,
+            io_workers=args.io_workers,
         )
         return _train_one_segment(
             label, splits, feature_cols, cat_cols, args, args.output_dir

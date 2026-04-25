@@ -51,18 +51,23 @@ def parse_args() -> argparse.Namespace:
                    help="Optional cap (debug only).")
     p.add_argument("--n-jobs", type=int, default=-1,
                    help="LightGBM prediction threads (-1 = all cores).")
+    p.add_argument("--io-workers", type=int, default=1,
+                   help="Thread workers for parallel parquet reads (1 = sequential).")
     return p.parse_args()
 
 
-def _gather_panel_for_segmentation(chunks_dir: Path) -> pd.DataFrame:
+def _gather_panel_for_segmentation(chunks_dir: Path, io_workers: int = 1) -> pd.DataFrame:
     """Read minimal cols from every chunk: ITEM_ID, XSRQ, lag_1 (proxy for QTY)."""
     files = sorted(chunks_dir.glob("*.parquet"))
     if not files:
         raise FileNotFoundError(f"No parquet chunks under {chunks_dir}")
     cols = ["INVENTORY_ITEM_ID", "XSRQ", "lag_1"]
-    parts = []
-    for f in files:
-        parts.append(pd.read_parquet(f, columns=cols))
+    if io_workers > 1 and len(files) > 1:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=io_workers) as ex:
+            parts = list(ex.map(lambda f: pd.read_parquet(f, columns=cols), files))
+    else:
+        parts = [pd.read_parquet(f, columns=cols) for f in files]
     return pd.concat(parts, ignore_index=True)
 
 
@@ -86,7 +91,7 @@ def main() -> None:
     target_col = f"target_{args.horizon}d"
 
     print(f"[1/4] Loading panel for segmentation from {args.chunks_dir} ...")
-    panel = _gather_panel_for_segmentation(args.chunks_dir)
+    panel = _gather_panel_for_segmentation(args.chunks_dir, io_workers=args.io_workers)
     print(f"      panel rows: {len(panel):,}, items: {panel['INVENTORY_ITEM_ID'].nunique():,}")
 
     print("[2/4] Computing item segments ...")
